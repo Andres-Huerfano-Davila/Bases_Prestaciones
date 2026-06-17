@@ -11,7 +11,7 @@ import streamlit as st
 # ============================================================
 # APP: Validador bases Prima y Cesantías - Nómina JMC
 # Enfoque corregido:
-# - NO es una herramienta de proyección.
+# - Es una herramienta de validación de base prestacional.
 # - La base se valida con ACUMULADOS históricos + HISTÓRICO DE SALARIOS.
 # - El salario fijo se calcula desde histórico salarial por vigencias.
 # - Los acumulados aportan variables / auxilios / bonos según parametrización.
@@ -780,6 +780,210 @@ def standardize_area_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, st
 # Cálculos principales
 # -----------------------------
 
+
+def file_size_mb(uploaded_file) -> float:
+    """Retorna el peso del archivo subido sin forzar lecturas adicionales."""
+    try:
+        return len(uploaded_file.getvalue()) / (1024 * 1024)
+    except Exception:
+        try:
+            return uploaded_file.size / (1024 * 1024)
+        except Exception:
+            return 0.0
+
+
+def _decode_sample(data: bytes, max_bytes: int = 2_000_000) -> Tuple[str, str]:
+    sample = data[:max_bytes]
+    for enc in ["utf-8-sig", "latin1", "cp1252"]:
+        try:
+            return sample.decode(enc), enc
+        except Exception:
+            continue
+    return sample.decode("latin1", errors="ignore"), "latin1"
+
+
+def _split_cells(line: str, sep: str) -> List[str]:
+    if sep == "|":
+        cells = [c.strip() for c in line.rstrip("\n\r").split("|")]
+        if cells and cells[0] == "":
+            cells = cells[1:]
+        if cells and cells[-1] == "":
+            cells = cells[:-1]
+        return cells
+    return [c.strip() for c in line.rstrip("\n\r").split(sep)]
+
+
+def detect_text_layout(data: bytes) -> Tuple[str, str, int, List[str]]:
+    """Detecta encoding, separador y fila de encabezado en TXT/CSV grandes sin leer todo el archivo."""
+    text, enc = _decode_sample(data)
+    lines = text.splitlines()
+    best = None
+    keywords = (
+        SAP_CANDIDATES + CONCEPT_CANDIDATES + VALUE_CANDIDATES + PERIOD_CANDIDATES
+        + MD_NAME_CANDIDATES + MD_AREA_CANDIDATES + SAL_FROM_CANDIDATES + SAL_TO_CANDIDATES
+    )
+    norm_keywords = [normalize_text(k) for k in keywords]
+    for sep in ["|", ";", "\t", ","]:
+        for idx, line in enumerate(lines[:250]):
+            if sep not in line:
+                continue
+            cells = _split_cells(line, sep)
+            if len(cells) < 3:
+                continue
+            norm_cells = [normalize_text(c) for c in cells]
+            non_empty = sum(1 for c in norm_cells if c)
+            if non_empty < 3:
+                continue
+            score = 0
+            for c in norm_cells:
+                if not c:
+                    continue
+                for k in norm_keywords:
+                    if k and (c == k or k in c or c in k):
+                        score += 1
+            joined = " ".join(norm_cells)
+            if "desde" in joined and "hasta" in joined:
+                score += 3
+            if "importe" in joined or "valor" in joined:
+                score += 2
+            if "periodo" in joined or "fecha de pago" in joined or "for period" in joined:
+                score += 2
+            if "cc nomina" in joined or "cc nómina" in joined or "concepto" in joined:
+                score += 2
+            if best is None or score > best[0]:
+                best = (score, sep, idx, cells)
+    if best is None or best[0] <= 0:
+        sep = max(["|", ";", "\t", ","], key=lambda s: text[:5000].count(s))
+        for idx, line in enumerate(lines[:50]):
+            cells = _split_cells(line, sep)
+            if len([c for c in cells if c]) >= 3:
+                return enc, sep, idx, cells
+        raise ValueError("No pude detectar el encabezado del archivo plano.")
+    _, sep, idx, headers = best
+    return enc, sep, idx, headers
+
+
+def _drop_empty_unnamed_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    drop_cols = []
+    for c in out.columns:
+        n = normalize_text(c)
+        if n.startswith("unnamed") or n == "nan" or n == "":
+            s = out[c].astype(str).str.strip().str.lower()
+            if s.replace({"nan": "", "none": "", "<na>": ""}).eq("").all():
+                drop_cols.append(c)
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+    return clean_columns(out)
+
+
+def aggregate_accumulated_table(
+    accum_std: pd.DataFrame,
+    concepts_allowed: Optional[List[str]] = None,
+    period_start: Optional[date] = None,
+    period_end: Optional[date] = None,
+) -> pd.DataFrame:
+    """Reduce acumulados a SAP/mes/concepto/texto para bajar memoria y peso del Excel."""
+    cols = ["SAP", "Concepto", "Texto Concepto", "Valor", "Cantidad", "Periodo_Mes", "Periodo_Original", "Registros_Origen"]
+    if accum_std is None or accum_std.empty:
+        return pd.DataFrame(columns=cols)
+    out = accum_std.copy()
+    if concepts_allowed:
+        out = out[out["Concepto"].isin(set(concepts_allowed))]
+    if period_start is not None:
+        p_start_ts = pd.Timestamp(period_start.year, period_start.month, 1)
+        out = out[out["Periodo_Mes"] >= p_start_ts]
+    if period_end is not None:
+        p_end_ts = pd.Timestamp(period_end.year, period_end.month, 1)
+        out = out[out["Periodo_Mes"] <= p_end_ts]
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    grouped = out.groupby(["SAP", "Periodo_Mes", "Concepto", "Texto Concepto"], as_index=False, dropna=False).agg(
+        Valor=("Valor", "sum"),
+        Cantidad=("Cantidad", "sum"),
+        Registros_Origen=("Valor", "size"),
+    )
+    grouped["Periodo_Original"] = grouped["Periodo_Mes"].dt.strftime("%Y-%m")
+    return grouped[cols]
+
+
+def read_accumulated_optimized(
+    uploaded_file,
+    sheet_name: Optional[str],
+    concepts_allowed: Optional[List[str]],
+    period_start: date,
+    period_end: date,
+    progress_cb=None,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Lee acumulados grandes de forma más liviana.
+
+    Para TXT/CSV usa chunks y reduce a SAP/mes/concepto antes de seguir el cálculo.
+    Esto evita que Streamlit Cloud tumbe el proceso por memoria al cargar archivos de 200 MB+.
+    """
+    ext = get_extension(uploaded_file.name)
+    if ext not in CSV_EXTS:
+        raw = read_uploaded_table(uploaded_file, sheet_name)
+        std, detected = standardize_accumulated(raw)
+        return aggregate_accumulated_table(std, concepts_allowed, period_start, period_end), detected
+
+    data = uploaded_file.getvalue()
+    enc, sep, header_idx, _headers = detect_text_layout(data)
+    chunks = []
+    detected = None
+    try:
+        reader = pd.read_csv(
+            io.BytesIO(data),
+            sep=sep,
+            encoding=enc,
+            dtype=str,
+            engine="python",
+            header=0,
+            skiprows=header_idx,
+            chunksize=120_000,
+            on_bad_lines="skip",
+        )
+        for i, chunk in enumerate(reader, start=1):
+            chunk = _drop_empty_unnamed_columns(chunk)
+            if chunk.empty:
+                continue
+            try:
+                std, det = standardize_accumulated(chunk)
+                detected = det if detected is None else detected
+            except Exception as exc:
+                if i == 1:
+                    raise exc
+                continue
+            std = aggregate_accumulated_table(std, concepts_allowed, period_start, period_end)
+            if not std.empty:
+                chunks.append(std)
+            if progress_cb is not None:
+                try:
+                    progress_cb(min(35, 10 + i))
+                except Exception:
+                    pass
+    except Exception:
+        raw = read_uploaded_table(uploaded_file, sheet_name)
+        std, detected = standardize_accumulated(raw)
+        return aggregate_accumulated_table(std, concepts_allowed, period_start, period_end), detected
+
+    if not chunks:
+        empty = pd.DataFrame(columns=["SAP", "Concepto", "Texto Concepto", "Valor", "Cantidad", "Periodo_Mes", "Periodo_Original", "Registros_Origen"])
+        if detected is None:
+            detected = {"Lectura": f"TXT/CSV sep={sep} enc={enc}", "Resultado": "Sin registros filtrados para conceptos/periodo"}
+        return empty, detected
+    out = pd.concat(chunks, ignore_index=True)
+    out = out.groupby(["SAP", "Periodo_Mes", "Concepto", "Texto Concepto"], as_index=False, dropna=False).agg(
+        Valor=("Valor", "sum"),
+        Cantidad=("Cantidad", "sum"),
+        Registros_Origen=("Registros_Origen", "sum"),
+    )
+    out["Periodo_Original"] = out["Periodo_Mes"].dt.strftime("%Y-%m")
+    if detected is None:
+        detected = {}
+    detected["Modo lectura"] = f"Optimizado por chunks sep={repr(sep)} encoding={enc}; detalle agrupado por SAP/mes/concepto"
+    return out[["SAP", "Concepto", "Texto Concepto", "Valor", "Cantidad", "Periodo_Mes", "Periodo_Original", "Registros_Origen"]], detected
+
+
 def build_population(accum: pd.DataFrame, salary_hist: pd.DataFrame, md_std: Optional[pd.DataFrame]) -> pd.DataFrame:
     saps = sorted(set(accum["SAP"].astype(str)) | set(salary_hist["SAP"].astype(str)))
     pop = pd.DataFrame({"SAP": saps})
@@ -1183,12 +1387,12 @@ def make_excel_report(
 # -----------------------------
 
 st.title("🦜 Validador de bases de prima y cesantías")
-st.caption("Modelo financiero nómina · Acumulados históricos + histórico de salarios · Sin proyección")
+st.caption("Modelo financiero nómina · Acumulados históricos + histórico de salarios · Validación de base prestacional")
 
 with st.expander("📌 Qué hace esta versión", expanded=True):
     st.markdown(
         """
-        Esta versión **no toma pagado del mes de proyección** ni calcula proyección.  
+        Esta versión valida la base prestacional con **acumulados históricos + histórico de salarios**.  
         Hace la validación de la base así:
 
         **Base calculada = salario histórico promedio por vigencias + variables promedio de acumulados.**
@@ -1249,51 +1453,14 @@ salary_sheet = sheet_selector(salary_file, "histórico salarios")
 md_sheet = sheet_selector(md_file, "MD")
 param_sheet = sheet_selector(param_file, "parametrización")
 
-read_log = []
-accum_std = None
-salary_std = None
-md_std = None
 concept_param = DEFAULT_CONCEPTS.copy()
 area_rules = DEFAULT_AREA_RULES.copy()
+read_log = []
 
-if md_file and md_sheet:
-    try:
-        md_raw = read_uploaded_table(md_file, md_sheet)
-        md_std, md_detected = standardize_md(md_raw)
-        read_log.append({"Paso": "Master Data", "Resultado": f"OK - {len(md_std):,} empleados", "Detalle": str(md_detected)})
-        st.success(f"Master Data leído: {len(md_std):,} empleados")
-        with st.expander("Columnas detectadas en MD"):
-            st.json(md_detected)
-    except Exception as exc:
-        st.warning(f"No se usará MD: {exc}")
-        md_std = None
-
-if accum_file and accum_sheet:
-    try:
-        accum_raw = read_uploaded_table(accum_file, accum_sheet)
-        accum_std, accum_detected = standardize_accumulated(accum_raw)
-        read_log.append({"Paso": "Acumulados", "Resultado": f"OK - {len(accum_std):,} registros", "Detalle": str(accum_detected)})
-        st.success(f"Acumulados leídos: {len(accum_std):,} registros")
-        with st.expander("Columnas detectadas en acumulados"):
-            st.json(accum_detected)
-    except Exception as exc:
-        st.error(f"Error leyendo acumulados: {exc}")
-
-if salary_file and salary_sheet:
-    try:
-        salary_raw = read_uploaded_table(salary_file, salary_sheet)
-        salary_std, salary_detected = standardize_salary_history(salary_raw, md_std, corte)
-        read_log.append({"Paso": "Histórico salarios", "Resultado": f"OK - {len(salary_std):,} vigencias", "Detalle": str(salary_detected)})
-        st.success(f"Histórico de salarios leído: {len(salary_std):,} vigencias")
-        with st.expander("Columnas detectadas en histórico de salarios"):
-            st.json(salary_detected)
-    except Exception as exc:
-        st.error(f"Error leyendo histórico de salarios: {exc}")
-
+# La parametrización sí se puede leer antes porque normalmente es pequeña.
 if param_file and param_sheet:
     try:
         param_raw = read_uploaded_table(param_file, param_sheet)
-        # El mismo archivo puede traer una hoja de conceptos o áreas. Si la hoja elegida parece áreas, carga áreas; si no, conceptos.
         try:
             param_area, area_detected = standardize_area_rules(param_raw)
             if set(param_area["Área de nómina"].dropna()) & {"ZM", "ZL", "ZH", "ZP"}:
@@ -1317,67 +1484,95 @@ st.subheader("2) Parametrización aplicada")
 pa, pc = st.columns(2)
 with pa:
     st.markdown("**Reglas por área de nómina**")
-    area_rules = st.data_editor(area_rules, use_container_width=True, num_rows="dynamic")
+    area_rules = st.data_editor(area_rules, width="stretch", num_rows="dynamic")
 with pc:
     st.markdown("**Conceptos para prima y cesantías**")
-    concept_param = st.data_editor(concept_param, use_container_width=True, num_rows="dynamic")
+    concept_param = st.data_editor(concept_param, width="stretch", num_rows="dynamic")
 
-if accum_std is not None and salary_std is not None:
-    st.subheader("3) Validación antes de generar")
-    prima_concepts = sorted(concept_param.loc[concept_param["Base_Prima"].astype(bool), "Concepto"].dropna().apply(extract_concept).unique().tolist())
-    ces_concepts = sorted(concept_param.loc[concept_param["Base_Cesantias"].astype(bool), "Concepto"].dropna().apply(extract_concept).unique().tolist())
+st.subheader("3) Generar validación")
+prima_concepts = sorted(concept_param.loc[concept_param["Base_Prima"].astype(bool), "Concepto"].dropna().apply(extract_concept).unique().tolist())
+ces_concepts = sorted(concept_param.loc[concept_param["Base_Cesantias"].astype(bool), "Concepto"].dropna().apply(extract_concept).unique().tolist())
+all_concepts = sorted(set(prima_concepts) | set(ces_concepts))
+period_start_all = min(prima_start, ces_start)
+period_end_all = max(prima_end, ces_end)
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Periodo prima", f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}")
-    with c2:
-        st.metric("Periodo cesantías", f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}")
-    with c3:
-        st.metric("Conceptos prima", len(prima_concepts))
-    with c4:
-        st.metric("Conceptos cesantías", len(ces_concepts))
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Periodo prima", f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}")
+with c2:
+    st.metric("Periodo cesantías", f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}")
+with c3:
+    st.metric("Conceptos prima", len(prima_concepts))
+with c4:
+    st.metric("Conceptos cesantías", len(ces_concepts))
 
-    periods_summary = (
-        accum_std.groupby(accum_std["Periodo_Mes"].dt.strftime("%Y-%m"), as_index=True)
-        .agg(Registros=("Valor", "size"), Valor=("Valor", "sum"))
-        .reset_index()
-        .rename(columns={"Periodo_Mes": "Periodo"})
-    )
-    with st.expander("Periodos encontrados en acumulados"):
-        st.dataframe(periods_summary, use_container_width=True)
-    with st.expander("Conceptos encontrados en acumulados"):
-        catalog = accum_std.groupby(["Concepto", "Texto Concepto"], as_index=False).agg(Valor_Total=("Valor", "sum"), Registros=("Valor", "size"))
-        catalog = catalog.merge(concept_param[["Concepto", "Base_Prima", "Base_Cesantias", "Tipo_Base"]], on="Concepto", how="left")
-        st.dataframe(catalog, use_container_width=True)
+if accum_file:
+    st.caption(f"Acumulados cargado: {accum_file.name} · {file_size_mb(accum_file):,.1f} MB. Se leerá solo al presionar Generar y en modo optimizado.")
+if salary_file:
+    st.caption(f"Histórico de salarios cargado: {salary_file.name} · {file_size_mb(salary_file):,.1f} MB.")
 
-    generate = st.button("🚀 Generar validación de bases", type="primary")
+if not accum_file or not salary_file:
+    st.info("Carga mínimo acumulados de nómina e histórico de salarios para continuar.")
+elif st.button("🚀 Generar validación de bases", type="primary"):
+    if prima_end < prima_start or ces_end < ces_start:
+        st.error("Revisa los periodos: la fecha final no puede ser menor que la inicial.")
+        st.stop()
+    if not prima_concepts or not ces_concepts:
+        st.error("La parametrización debe dejar al menos un concepto para prima y uno para cesantías.")
+        st.stop()
 
-    if generate:
-        if prima_end < prima_start or ces_end < ces_start:
-            st.error("Revisa los periodos: la fecha final no puede ser menor que la inicial.")
-            st.stop()
-        if not prima_concepts or not ces_concepts:
-            st.error("La parametrización debe dejar al menos un concepto para prima y uno para cesantías.")
-            st.stop()
+    progress = st.progress(0)
+    status = st.empty()
+    md_std = None
+    salary_std = None
+    accum_std = None
 
-        progress = st.progress(0)
-        status = st.empty()
+    try:
+        if md_file and md_sheet:
+            status.write("Leyendo Master Data...")
+            md_raw = read_uploaded_table(md_file, md_sheet)
+            md_std, md_detected = standardize_md(md_raw)
+            read_log.append({"Paso": "Master Data", "Resultado": f"OK - {len(md_std):,} empleados", "Detalle": str(md_detected)})
+            progress.progress(8)
+        else:
+            progress.progress(5)
+
+        status.write("Leyendo histórico de salarios...")
+        salary_raw = read_uploaded_table(salary_file, salary_sheet)
+        salary_std, salary_detected = standardize_salary_history(salary_raw, md_std, corte)
+        read_log.append({"Paso": "Histórico salarios", "Resultado": f"OK - {len(salary_std):,} vigencias", "Detalle": str(salary_detected)})
+        progress.progress(18)
+
+        status.write("Leyendo acumulados en modo optimizado. Esto puede tardar con archivos grandes...")
+        accum_std, accum_detected = read_accumulated_optimized(
+            accum_file,
+            accum_sheet,
+            all_concepts,
+            period_start_all,
+            period_end_all,
+            progress_cb=lambda p: progress.progress(min(max(int(p), 18), 35)),
+        )
+        read_log.append({"Paso": "Acumulados", "Resultado": f"OK - {len(accum_std):,} registros agrupados", "Detalle": str(accum_detected)})
+        progress.progress(38)
+
+        if accum_std.empty:
+            st.warning("Los acumulados quedaron sin registros para los conceptos/periodos seleccionados. Revisa la parametrización o las columnas detectadas.")
 
         status.write("Preparando población...")
         population = build_population(accum_std, salary_std, md_std)
-        progress.progress(15)
+        progress.progress(45)
 
         status.write("Calculando prima con histórico salarial + acumulados...")
         base_prima, sal_detail_prima, var_detail_prima = calc_base_for_label(
             "Prima", population, salary_std, accum_std, prima_concepts, prima_start, prima_end, area_rules, concept_param
         )
-        progress.progress(40)
+        progress.progress(60)
 
         status.write("Calculando cesantías con histórico salarial + acumulados...")
         base_ces, sal_detail_ces, var_detail_ces = calc_base_for_label(
             "Cesantias", population, salary_std, accum_std, ces_concepts, ces_start, ces_end, area_rules, concept_param
         )
-        progress.progress(65)
+        progress.progress(72)
 
         status.write("Armando salida...")
         llevar_modelo = base_prima[[
@@ -1393,12 +1588,12 @@ if accum_std is not None and salary_std is not None:
         )
         llevar_modelo["Periodo prima usado"] = f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}"
         llevar_modelo["Periodo cesantías usado"] = f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}"
-        llevar_modelo["Observación"] = "Validación con acumulados históricos e histórico de salarios; sin proyección."
+        llevar_modelo["Observación"] = "Validación con acumulados históricos e histórico de salarios."
 
         detail_accum = build_detail_accum(accum_std, concept_param, prima_concepts, ces_concepts, prima_start, prima_end, ces_start, ces_end)
         sal_detail = pd.concat([sal_detail_prima, sal_detail_ces], ignore_index=True) if not sal_detail_prima.empty or not sal_detail_ces.empty else pd.DataFrame()
         alerts = build_alerts(base_prima, base_ces)
-        progress.progress(80)
+        progress.progress(82)
 
         log_df = pd.DataFrame(read_log + [
             {"Paso": "Periodo prima", "Resultado": f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}", "Detalle": "Últimos 6 meses si se dejó automático."},
@@ -1406,6 +1601,7 @@ if accum_std is not None and salary_std is not None:
             {"Paso": "Reglas área", "Resultado": f"{len(area_rules):,} reglas", "Detalle": area_rules.to_dict(orient="records")},
             {"Paso": "Conceptos salario fijo", "Resultado": ", ".join(sorted(FIXED_SALARY_CONCEPTS)), "Detalle": "Se calculan desde histórico salarial, no se duplican como variable."},
             {"Paso": "Fórmula", "Resultado": "Base calculada = salario histórico promedio + promedio variable acumulado", "Detalle": "La base SAP acumulada estimada se deja como comparación."},
+            {"Paso": "Optimización", "Resultado": "Acumulados leídos al generar y agrupados por SAP/mes/concepto", "Detalle": "Evita caídas de health check por archivos grandes en Streamlit Cloud."},
         ])
 
         excel_bytes = make_excel_report(
@@ -1423,7 +1619,20 @@ if accum_std is not None and salary_std is not None:
         with r3:
             st.metric("Tramos salariales calculados", f"{len(sal_detail):,}")
 
-        st.dataframe(llevar_modelo.head(300), use_container_width=True)
+        with st.expander("Periodos encontrados en acumulados agrupados"):
+            periods_summary = (
+                accum_std.groupby(accum_std["Periodo_Mes"].dt.strftime("%Y-%m"), as_index=True)
+                .agg(Registros=("Valor", "size"), Valor=("Valor", "sum"))
+                .reset_index()
+                .rename(columns={"Periodo_Mes": "Periodo"})
+            )
+            st.dataframe(periods_summary, width="stretch")
+        with st.expander("Conceptos encontrados en acumulados agrupados"):
+            catalog = accum_std.groupby(["Concepto", "Texto Concepto"], as_index=False).agg(Valor_Total=("Valor", "sum"), Registros=("Valor", "size"))
+            catalog = catalog.merge(concept_param[["Concepto", "Base_Prima", "Base_Cesantias", "Tipo_Base"]], on="Concepto", how="left")
+            st.dataframe(catalog, width="stretch")
+
+        st.dataframe(llevar_modelo.head(300), width="stretch")
         st.download_button(
             "⬇️ Descargar Excel generado",
             data=excel_bytes,
@@ -1431,8 +1640,11 @@ if accum_std is not None and salary_std is not None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
-else:
-    st.info("Carga mínimo acumulados de nómina e histórico de salarios para continuar.")
+
+    except Exception as exc:
+        status.empty()
+        st.error(f"Error generando la validación: {exc}")
+        st.exception(exc)
 
 st.divider()
 st.caption("🦜 Creado por Andrés Huérfano Dávila - Nómina JMC")
