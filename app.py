@@ -2,55 +2,80 @@ import io
 import re
 import unicodedata
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 # ============================================================
-# APP: Validador de bases de Prima y Cesantías - Nómina JMC
-# Enfoque correcto:
-# - NO es proyección.
-# - Genera bases prestacionales usando acumulados históricos.
-# - Calcula el componente salarial mediante histórico de salarios.
-# - Permite validar diferencias entre salario histórico y acumulados SAP.
+# APP: Validador bases Prima y Cesantías - Nómina JMC
+# Enfoque corregido:
+# - NO es una herramienta de proyección.
+# - La base se valida con ACUMULADOS históricos + HISTÓRICO DE SALARIOS.
+# - El salario fijo se calcula desde histórico salarial por vigencias.
+# - Los acumulados aportan variables / auxilios / bonos según parametrización.
+# - La parametrización por área de nómina define cómo se cuentan los días.
 # ============================================================
 
 st.set_page_config(
-    page_title="Bases prima y cesantías | Nómina JMC",
+    page_title="Validador bases prima y cesantías | Nómina JMC",
     page_icon="🦜",
     layout="wide",
 )
 
 # -----------------------------
-# Parámetros base
+# Parametrizaciones base
 # -----------------------------
-SALARY_CONCEPTS_DEFAULT = {"Y010", "Y011", "Y020", "Y050", "Y051", "Y090"}
+FIXED_SALARY_CONCEPTS = {"Y010", "Y011", "Y020", "Y050", "Y051", "Y090"}
 
-DEFAULT_BASE_PRESTACIONES = {
-    # Salariales / básicos, normalmente se validan contra histórico de salarios
-    "Y010", "Y011", "Y020", "Y050", "Y051", "Y090",
-    # Auxilio transporte, si aplica en la parametrización de prestaciones
-    "Y200",
-    # Horas, recargos, compensatorios y variables habituales
-    "Y220", "Y221", "Y300", "Y305", "Y310", "Y315", "Y350", "YM01",
-    # Bonos salariales habituales del modelo financiero
-    "Y506", "Y610", "Y617", "Y618",
-}
+DEFAULT_CONCEPTS = pd.DataFrame(
+    [
+        # Concepto, descripción, prima, cesantías, tipo
+        ("Y010", "Sueldo básico", True, True, "SALARIO_FIJO_HISTORICO"),
+        ("Y011", "Part time días", True, True, "SALARIO_FIJO_HISTORICO"),
+        ("Y020", "Salario integral", True, True, "SALARIO_FIJO_HISTORICO"),
+        ("Y050", "Apoyo sostenimiento", True, True, "SALARIO_FIJO_HISTORICO"),
+        ("Y051", "Apoyo practicante", True, True, "SALARIO_FIJO_HISTORICO"),
+        ("Y090", "Part time horas", True, True, "SALARIO_FIJO_HISTORICO"),
+        ("Y200", "Auxilio de transporte", True, True, "VARIABLE_ACUMULADO"),
+        ("Y220", "Recargo nocturno", True, True, "VARIABLE_ACUMULADO"),
+        ("Y221", "Recargo nocturno festivo", True, True, "VARIABLE_ACUMULADO"),
+        ("Y300", "Hora extra diurna", True, True, "VARIABLE_ACUMULADO"),
+        ("Y305", "Hora extra nocturna", True, True, "VARIABLE_ACUMULADO"),
+        ("Y310", "Hora extra dominical diurna", True, True, "VARIABLE_ACUMULADO"),
+        ("Y315", "Hora extra dominical nocturna", True, True, "VARIABLE_ACUMULADO"),
+        ("Y350", "Compensatorio", True, True, "VARIABLE_ACUMULADO"),
+        ("YM01", "Tiempo suplementario YM01", True, True, "VARIABLE_ACUMULADO"),
+        ("Y506", "Bono salarial", True, True, "VARIABLE_ACUMULADO"),
+        ("Y610", "Bono salarial", True, True, "VARIABLE_ACUMULADO"),
+        ("Y617", "Bono salarial", True, True, "VARIABLE_ACUMULADO"),
+        ("Y618", "Bono salarial", True, True, "VARIABLE_ACUMULADO"),
+    ],
+    columns=["Concepto", "Descripción", "Base_Prima", "Base_Cesantias", "Tipo_Base"],
+)
+
+DEFAULT_AREA_RULES = pd.DataFrame(
+    [
+        ("ZM", "Administrativos / base 360", "DIAS_360", 30, "Salario mensual ponderado por días 360"),
+        ("ZL", "Mensual admon 365 / días reales", "DIAS_CALENDARIO", 30, "Salario mensual ponderado por días calendario"),
+        ("ZH", "Part time horas", "DIAS_CALENDARIO", 30, "ZH se trata con base 365 para promedio"),
+        ("ZP", "Part time días", "DIAS_CALENDARIO", 30, "ZP se trata con base 365 para promedio"),
+    ],
+    columns=["Área de nómina", "Descripción", "Regla_Dias", "Mensualizar_A", "Observación"],
+)
 
 EXCEL_EXTS = {".xlsx", ".xlsm", ".xls", ".xlsb", ".ods"}
 CSV_EXTS = {".csv", ".txt"}
-MAX_SAFE_DATE = date(2099, 12, 31)
 
 SAP_CANDIDATES = [
     "sap", "nº pers", "n° pers", "no pers", "nro pers", "numero personal",
     "número personal", "pernr", "cod sap", "codigo sap", "código sap", "usuario",
-    "employee id", "id empleado", "colaborador", "n pers", "n. pers", "personal",
+    "employee id", "id empleado", "colaborador", "n pers", "personal", "nro personal",
 ]
 CONCEPT_CANDIDATES = [
     "cc-nomina", "cc nomina", "cc-nómina", "cc nómina", "concepto", "codigo concepto",
     "código concepto", "cod concepto", "lgart", "clase de nomina", "clase de nómina",
-    "cc nom", "cl.nomina", "cl nómina",
 ]
 CONCEPT_TEXT_CANDIDATES = [
     "texto", "descripcion", "descripción", "desc concepto", "descripcion concepto",
@@ -59,37 +84,39 @@ CONCEPT_TEXT_CANDIDATES = [
 VALUE_CANDIDATES = [
     "valor", "importe", "monto", "devengo", "valor pago", "valor pagado", "total",
     "amount", "valor concepto", "importe moneda", "valor ml", "valor acumulado",
-    "pago", "pagado", "vlr", "valor nómina", "valor nomina",
 ]
 QTY_CANDIDATES = ["cantidad", "cant", "dias", "días", "horas", "numero", "número"]
 PERIOD_CANDIDATES = [
     "periodo", "período", "periodo nomina", "período nómina", "periodo para nomina",
     "periodo para nómina", "fecha de pago", "fecha pago", "mes", "mes pago", "for-period",
     "periodo pago", "período pago", "fecha contabilizacion", "fecha contabilización",
-    "fecha", "pay period", "payroll period",
 ]
 
 MD_NAME_CANDIDATES = ["nombre", "nombres", "nombre completo", "empleado", "trabajador"]
 MD_DOC_CANDIDATES = ["cedula", "cédula", "numero id", "número id", "documento", "id", "identificacion", "identificación"]
-MD_AREA_CANDIDATES = ["area de nomina", "área de nómina", "area nomina", "área nómina"]
-MD_CECO_CANDIDATES = ["ce.coste", "ce coste", "ceco", "centro de coste", "centro de costo", "centro coste"]
+MD_AREA_CANDIDATES = ["area de nomina", "área de nómina", "area nomina", "área nómina", "area cálculo nómina", "area calculo nomina"]
+MD_CECO_CANDIDATES = ["ce.coste", "ce coste", "ceco", "centro de coste", "centro de costo"]
 MD_CARGO_CANDIDATES = ["cargo", "funcion", "función", "posicion", "posición"]
 MD_SALARY_CANDIDATES = ["salario total", "salario", "sueldo", "sueldo basico", "sueldo básico"]
-MD_INGRESO_CANDIDATES = ["fecha ingreso", "fecha de ingreso", "ingreso", "alta", "fecha alta", "fecha contratación"]
+MD_INGRESO_CANDIDATES = ["fecha ingreso", "fecha de ingreso", "ingreso", "alta", "fecha alta"]
 MD_RETIRO_CANDIDATES = ["fecha retiro", "fecha de retiro", "retiro", "baja", "fecha baja"]
 
 SAL_FROM_CANDIDATES = [
-    "desde", "fecha desde", "vigencia desde", "fecha inicio", "inicio", "begda",
-    "fecha salario", "fecha cambio", "fecha modificacion", "fecha modificación", "fecha",
+    "fecha desde", "desde", "inicio", "fecha inicio", "vigencia desde", "válido desde", "valido desde",
+    "fecha inicial", "begda", "inicio vigencia",
 ]
 SAL_TO_CANDIDATES = [
-    "hasta", "fecha hasta", "vigencia hasta", "fecha fin", "fin", "endda",
-    "fecha final", "fecha termino", "fecha término",
+    "fecha hasta", "hasta", "fin", "fecha fin", "vigencia hasta", "válido hasta", "valido hasta",
+    "fecha final", "endda", "fin vigencia",
 ]
-SAL_PERIOD_CANDIDATES = PERIOD_CANDIDATES + ["mes salario", "periodo salario"]
+SAL_VALUE_CANDIDATES = [
+    "salario total", "salario", "sueldo", "sueldo basico", "sueldo básico", "importe", "valor", "valor salario",
+]
+AREA_RULE_CANDIDATES = ["regla dias", "regla_dias", "regla días", "tipo dias", "tipo días", "metodo", "método"]
+MONTHLY_TO_CANDIDATES = ["mensualizar a", "mensualizar_a", "mensualizacion", "mensualización", "dias mensualizar", "días mensualizar"]
 
 # -----------------------------
-# Utilidades generales
+# Utilidades
 # -----------------------------
 
 def normalize_text(value) -> str:
@@ -99,8 +126,8 @@ def normalize_text(value) -> str:
     text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     text = re.sub(r"[\n\r\t]+", " ", text)
+    text = text.replace("_", " ").replace("-", " ")
     text = re.sub(r"\s+", " ", text)
-    text = text.replace("_", " ").replace("-", " ").replace(".", " ")
     return text.strip()
 
 
@@ -121,12 +148,10 @@ def find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for cand in norm_candidates:
         if cand in norm_cols:
             return norm_cols[cand]
-
     for cand in norm_candidates:
         for norm_col, original in norm_cols.items():
             if cand and cand in norm_col:
                 return original
-
     for cand in norm_candidates:
         for norm_col, original in norm_cols.items():
             if norm_col and norm_col in cand:
@@ -155,20 +180,18 @@ def get_sheet_names(uploaded_file) -> List[str]:
     if ext not in EXCEL_EXTS:
         return ["Archivo plano"]
     data = uploaded_file.getvalue()
-    engine = excel_engine_for_name(uploaded_file.name)
-    xls = pd.ExcelFile(io.BytesIO(data), engine=engine)
+    xls = pd.ExcelFile(io.BytesIO(data), engine=excel_engine_for_name(uploaded_file.name))
     return xls.sheet_names
 
 
 def detect_header_row(raw_preview: pd.DataFrame) -> int:
     keywords = (
-        SAP_CANDIDATES + CONCEPT_CANDIDATES + VALUE_CANDIDATES + PERIOD_CANDIDATES +
-        MD_NAME_CANDIDATES + MD_CECO_CANDIDATES + SAL_FROM_CANDIDATES + SAL_TO_CANDIDATES
+        SAP_CANDIDATES + CONCEPT_CANDIDATES + VALUE_CANDIDATES + PERIOD_CANDIDATES
+        + MD_NAME_CANDIDATES + MD_CECO_CANDIDATES + SAL_FROM_CANDIDATES + SAL_TO_CANDIDATES
     )
     norm_keywords = [normalize_text(k) for k in keywords]
-    best_row = 0
-    best_score = -1
-    for idx in range(min(len(raw_preview), 35)):
+    best_row, best_score = 0, -1
+    for idx in range(min(len(raw_preview), 40)):
         values = [normalize_text(v) for v in raw_preview.iloc[idx].tolist()]
         score = 0
         for v in values:
@@ -179,8 +202,7 @@ def detect_header_row(raw_preview: pd.DataFrame) -> int:
                     score += 1
         non_empty = sum(1 for v in values if v)
         if non_empty >= 2 and score > best_score:
-            best_score = score
-            best_row = idx
+            best_row, best_score = idx, score
     return best_row if best_score > 0 else 0
 
 
@@ -189,16 +211,14 @@ def read_uploaded_table(uploaded_file, sheet_name: Optional[str] = None) -> pd.D
     data = uploaded_file.getvalue()
 
     if ext in CSV_EXTS:
-        best = None
-        best_cols = -1
+        best, best_cols = None, -1
         for enc in ["utf-8-sig", "latin1", "cp1252"]:
             for sep in [";", ",", "\t", "|"]:
                 try:
                     df = pd.read_csv(io.BytesIO(data), sep=sep, encoding=enc, dtype=str, engine="python")
                     df = clean_columns(df)
                     if len(df.columns) > best_cols:
-                        best = df
-                        best_cols = len(df.columns)
+                        best, best_cols = df, len(df.columns)
                 except Exception:
                     pass
         if best is None:
@@ -208,12 +228,12 @@ def read_uploaded_table(uploaded_file, sheet_name: Optional[str] = None) -> pd.D
     if ext in EXCEL_EXTS:
         engine = excel_engine_for_name(uploaded_file.name)
         sheet = sheet_name if sheet_name and sheet_name != "Archivo plano" else 0
-        preview = pd.read_excel(io.BytesIO(data), sheet_name=sheet, header=None, nrows=35, engine=engine)
+        preview = pd.read_excel(io.BytesIO(data), sheet_name=sheet, header=None, nrows=40, engine=engine)
         header_row = detect_header_row(preview)
         df = pd.read_excel(io.BytesIO(data), sheet_name=sheet, header=header_row, engine=engine, dtype=object)
         return clean_columns(df)
 
-    raise ValueError(f"Extensión no soportada: {ext}. Usa xlsx, xlsm, xls, xlsb, ods, csv o txt.")
+    raise ValueError(f"Extensión no soportada: {ext}.")
 
 
 def normalize_sap(value) -> str:
@@ -225,6 +245,20 @@ def normalize_sap(value) -> str:
     if digits:
         return digits.lstrip("0") or "0"
     return text.strip()
+
+
+def normalize_area(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).upper().strip()
+    m = re.search(r"\b(ZM|ZL|ZH|ZP)\b", text)
+    if m:
+        return m.group(1)
+    # Si viene como texto largo, buscar la sigla pegada.
+    for area in ["ZM", "ZL", "ZH", "ZP"]:
+        if area in text:
+            return area
+    return text
 
 
 def extract_concept(value) -> str:
@@ -279,10 +313,6 @@ def to_number_series(series: pd.Series) -> pd.Series:
     return series.apply(parse_number).astype(float)
 
 
-def is_last_day_of_month(d: date) -> bool:
-    return d == month_last_day(d.year, d.month)
-
-
 def parse_date_value(value) -> pd.Timestamp:
     if value is None or pd.isna(value):
         return pd.NaT
@@ -300,8 +330,6 @@ def parse_date_value(value) -> pd.Timestamp:
     s = str(value).strip()
     if not s:
         return pd.NaT
-    if "9999" in s:
-        return pd.Timestamp(MAX_SAFE_DATE)
     s = re.sub(r"\s+00:00:00$", "", s)
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
@@ -326,9 +354,9 @@ def parse_period_value(value) -> pd.Timestamp:
     s = str(value).strip()
     if not s:
         return pd.NaT
-    s2 = s.replace("_", "/").replace("-", "/").replace(".", "/")
-    s2 = re.sub(r"\s+", "", s2)
-    m = re.fullmatch(r"(\d{6})", s2)
+    s = s.replace("_", "/").replace("-", "/").replace(".", "/")
+    s = re.sub(r"\s+", "", s)
+    m = re.fullmatch(r"(\d{6})", s)
     if m:
         val = m.group(1)
         y1, m1 = int(val[:4]), int(val[4:])
@@ -337,103 +365,73 @@ def parse_period_value(value) -> pd.Timestamp:
         m2, y2 = int(val[:2]), int(val[2:])
         if 1 <= m2 <= 12 and 1900 <= y2 <= 2100:
             return pd.Timestamp(year=y2, month=m2, day=1)
-    m = re.fullmatch(r"(\d{1,4})/(\d{1,4})", s2)
+    m = re.fullmatch(r"(\d{1,4})/(\d{1,4})", s)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         if 1900 <= a <= 2100 and 1 <= b <= 12:
             return pd.Timestamp(year=a, month=b, day=1)
         if 1 <= a <= 12 and 1900 <= b <= 2100:
             return pd.Timestamp(year=b, month=a, day=1)
-    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+    dt = pd.to_datetime(str(value), dayfirst=True, errors="coerce")
     if pd.notna(dt):
         return pd.Timestamp(year=dt.year, month=dt.month, day=1)
     return pd.NaT
 
 
-def parse_period_series(series: pd.Series) -> pd.Series:
-    return series.apply(parse_period_value)
+def month_last_day(d: date) -> date:
+    if d.month == 12:
+        return date(d.year, 12, 31)
+    return date(d.year, d.month + 1, 1) - timedelta(days=1)
 
 
-def month_first_day(year: int, month: int) -> date:
-    return date(year, month, 1)
-
-
-def month_last_day(year: int, month: int) -> date:
-    if month == 12:
-        return date(year, 12, 31)
-    return date(year, month + 1, 1) - timedelta(days=1)
-
-
-def add_months(d: date, months: int) -> date:
-    y = d.year + (d.month - 1 + months) // 12
-    m = (d.month - 1 + months) % 12 + 1
+def add_months(first_day: date, months: int) -> date:
+    y = first_day.year + (first_day.month - 1 + months) // 12
+    m = (first_day.month - 1 + months) % 12 + 1
     return date(y, m, 1)
 
 
-def day_30_value(d: date) -> int:
-    if is_last_day_of_month(d):
-        return 30
-    return min(d.day, 30)
-
-
-def payroll_days_360_inclusive(start_dt: date, end_dt: date) -> int:
-    """Días tipo nómina colombiana: cada mes pesa 30; último día de mes cuenta como día 30."""
-    if pd.isna(start_dt) or pd.isna(end_dt) or end_dt < start_dt:
+def days360_colombian(start_d: date, end_d: date) -> int:
+    """Conteo 360 simple inclusivo: cada mes máximo 30 días."""
+    if end_d < start_d:
         return 0
-    return (end_dt.year - start_dt.year) * 360 + (end_dt.month - start_dt.month) * 30 + (day_30_value(end_dt) - day_30_value(start_dt)) + 1
+    y1, m1, d1 = start_d.year, start_d.month, min(start_d.day, 30)
+    y2, m2, d2 = end_d.year, end_d.month, min(end_d.day, 30)
+    return (y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1) + 1
 
 
-def actual_days_inclusive(start_dt: date, end_dt: date) -> int:
-    if pd.isna(start_dt) or pd.isna(end_dt) or end_dt < start_dt:
+def calendar_days(start_d: date, end_d: date) -> int:
+    if end_d < start_d:
         return 0
-    return (end_dt - start_dt).days + 1
+    return (end_d - start_d).days + 1
 
 
-def count_days(start_dt: date, end_dt: date, day_mode: str) -> int:
-    if day_mode == "Días calendario reales":
-        return actual_days_inclusive(start_dt, end_dt)
-    return payroll_days_360_inclusive(start_dt, end_dt)
+def area_days(start_d: date, end_d: date, area: str, area_rules: pd.DataFrame) -> int:
+    area_norm = normalize_area(area)
+    rules = area_rules.copy()
+    rules["_area"] = rules["Área de nómina"].apply(normalize_area)
+    match = rules[rules["_area"] == area_norm]
+    rule = "DIAS_CALENDARIO"
+    if not match.empty:
+        rule = str(match.iloc[0].get("Regla_Dias", "DIAS_CALENDARIO")).upper().strip()
+    if "360" in rule:
+        return days360_colombian(start_d, end_d)
+    return calendar_days(start_d, end_d)
 
 
-def as_date(value) -> Optional[date]:
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return value.date()
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    dt = parse_date_value(value)
-    return dt.date() if pd.notna(dt) else None
+def month_count_inclusive(start_d: date, end_d: date) -> int:
+    if end_d < start_d:
+        return 0
+    return (end_d.year - start_d.year) * 12 + (end_d.month - start_d.month) + 1
 
 
-def effective_window(period_start: date, period_end: date, ingreso, retiro) -> Tuple[Optional[date], Optional[date]]:
-    ini = period_start
-    fin = period_end
-    ing = as_date(ingreso)
-    ret = as_date(retiro)
-    if ing:
-        ini = max(ini, ing)
-    if ret and ret < MAX_SAFE_DATE:
-        fin = min(fin, ret)
-    if fin < ini:
-        return None, None
-    return ini, fin
-
-
-def format_month(dt: pd.Timestamp) -> str:
-    return dt.strftime("%Y-%m") if pd.notna(dt) else ""
-
-
-def parse_bool(value) -> bool:
+def safe_bool(value) -> bool:
     if value is None or pd.isna(value):
         return False
     s = normalize_text(value)
-    return s in {"si", "s", "x", "true", "verdadero", "1", "aplica", "yes", "y", "ok"}
+    return s in {"si", "s", "x", "true", "verdadero", "1", "aplica", "yes", "y"}
 
 # -----------------------------
-# Estandarización de insumos
+# Estandarización de archivos
 # -----------------------------
 
 def standardize_accumulated(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -462,8 +460,8 @@ def standardize_accumulated(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, s
     out["Texto Concepto"] = df[text_col].astype(str).str.strip() if text_col else out["Concepto"]
     out["Valor"] = to_number_series(df[value_col])
     out["Cantidad"] = to_number_series(df[qty_col]) if qty_col else 0.0
-    out["Periodo_Mes"] = parse_period_series(df[period_col])
-    out["Periodo original"] = df[period_col]
+    out["Periodo_Mes"] = df[period_col].apply(parse_period_value)
+    out["Periodo_Original"] = df[period_col].astype(str)
     out = out[(out["SAP"] != "") & (out["Concepto"] != "")]
     out = out[pd.notna(out["Periodo_Mes"])]
 
@@ -482,13 +480,11 @@ def standardize_md(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     sap_col = find_column(df, SAP_CANDIDATES)
     if not sap_col:
         raise ValueError("No encontré columna SAP / Nº pers. en el Master Data.")
-
     name_col = find_column(df, MD_NAME_CANDIDATES)
     doc_col = find_column(df, MD_DOC_CANDIDATES)
     area_col = find_column(df, MD_AREA_CANDIDATES)
     ceco_col = find_column(df, MD_CECO_CANDIDATES)
     cargo_col = find_column(df, MD_CARGO_CANDIDATES)
-    salary_col = find_column(df, MD_SALARY_CANDIDATES)
     ingreso_col = find_column(df, MD_INGRESO_CANDIDATES)
     retiro_col = find_column(df, MD_RETIRO_CANDIDATES)
 
@@ -496,10 +492,9 @@ def standardize_md(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     out["SAP"] = df[sap_col].apply(normalize_sap)
     out["Cédula"] = df[doc_col].astype(str).str.strip() if doc_col else ""
     out["Nombre"] = df[name_col].astype(str).str.strip() if name_col else ""
-    out["Área de nómina"] = df[area_col].astype(str).str.strip() if area_col else ""
+    out["Área de nómina"] = df[area_col].apply(normalize_area) if area_col else ""
     out["CECO"] = df[ceco_col].astype(str).str.strip() if ceco_col else ""
     out["Cargo"] = df[cargo_col].astype(str).str.strip() if cargo_col else ""
-    out["Salario actual MD"] = to_number_series(df[salary_col]) if salary_col else 0.0
     out["Fecha ingreso"] = parse_date_series(df[ingreso_col]) if ingreso_col else pd.NaT
     out["Fecha retiro"] = parse_date_series(df[retiro_col]) if retiro_col else pd.NaT
     out = out[out["SAP"] != ""].drop_duplicates(subset=["SAP"], keep="last")
@@ -511,450 +506,387 @@ def standardize_md(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
         "Área de nómina": area_col or "No detectada",
         "CECO": ceco_col or "No detectada",
         "Cargo": cargo_col or "No detectada",
-        "Salario actual MD": salary_col or "No detectada",
         "Fecha ingreso": ingreso_col or "No detectada",
         "Fecha retiro": retiro_col or "No detectada",
     }
     return out, detected
 
 
-def standardize_salary_history(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+def standardize_salary_history(df: pd.DataFrame, md_std: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, str]]:
     sap_col = find_column(df, SAP_CANDIDATES)
-    salary_col = find_column(df, MD_SALARY_CANDIDATES + ["salario mensual", "valor salario", "sueldo mensual"])
+    area_col = find_column(df, MD_AREA_CANDIDATES)
+    sal_col = find_column(df, SAL_VALUE_CANDIDATES)
     from_col = find_column(df, SAL_FROM_CANDIDATES)
     to_col = find_column(df, SAL_TO_CANDIDATES)
-    period_col = find_column(df, SAL_PERIOD_CANDIDATES)
 
     missing = []
     if not sap_col:
         missing.append("SAP / Nº pers.")
-    if not salary_col:
+    if not sal_col:
         missing.append("Salario")
-    if not from_col and not period_col:
-        missing.append("Desde / Fecha de inicio / Periodo")
+    if not from_col:
+        missing.append("Fecha desde / inicio vigencia")
+    if not to_col:
+        missing.append("Fecha hasta / fin vigencia")
     if missing:
         raise ValueError("No encontré estas columnas en histórico de salarios: " + ", ".join(missing))
 
     out = pd.DataFrame()
     out["SAP"] = df[sap_col].apply(normalize_sap)
-    out["Salario"] = to_number_series(df[salary_col])
+    out["Área de nómina"] = df[area_col].apply(normalize_area) if area_col else ""
+    out["Salario Vigencia"] = to_number_series(df[sal_col])
+    out["Desde"] = parse_date_series(df[from_col])
+    out["Hasta"] = parse_date_series(df[to_col])
+    out = out[(out["SAP"] != "") & (out["Salario Vigencia"] > 0)]
+    out = out[pd.notna(out["Desde"])]
+    out.loc[pd.isna(out["Hasta"]), "Hasta"] = pd.Timestamp(9999, 12, 31)
 
-    if from_col:
-        out["Desde"] = parse_date_series(df[from_col])
-    else:
-        out["Desde"] = parse_period_series(df[period_col])
-
-    if to_col:
-        out["Hasta"] = parse_date_series(df[to_col])
-    elif period_col and not from_col:
-        per = parse_period_series(df[period_col])
-        out["Hasta"] = per.apply(lambda x: pd.Timestamp(month_last_day(x.year, x.month)) if pd.notna(x) else pd.NaT)
-    else:
-        out["Hasta"] = pd.NaT
-
-    out = out[(out["SAP"] != "") & (out["Salario"] > 0) & pd.notna(out["Desde"])]
-    out = out.sort_values(["SAP", "Desde"]).copy()
-
-    # Si no viene fecha hasta, se infiere con el siguiente cambio de salario del mismo SAP.
-    out["Siguiente_Desde"] = out.groupby("SAP")["Desde"].shift(-1)
-    inferred_until = out["Siguiente_Desde"] - pd.Timedelta(days=1)
-    out["Hasta"] = out["Hasta"].where(pd.notna(out["Hasta"]), inferred_until)
-    out["Hasta"] = out["Hasta"].where(pd.notna(out["Hasta"]), pd.Timestamp(MAX_SAFE_DATE))
-    out.loc[out["Hasta"] < out["Desde"], "Hasta"] = out.loc[out["Hasta"] < out["Desde"], "Desde"]
-    out = out.drop(columns=["Siguiente_Desde"])
+    if md_std is not None and not md_std.empty:
+        area_map = md_std[["SAP", "Área de nómina"]].drop_duplicates("SAP")
+        out = out.merge(area_map.rename(columns={"Área de nómina": "Área MD"}), on="SAP", how="left")
+        out["Área de nómina"] = out["Área de nómina"].where(out["Área de nómina"].astype(str).str.strip() != "", out["Área MD"].fillna(""))
+        out = out.drop(columns=["Área MD"])
 
     detected = {
         "SAP": sap_col,
-        "Salario": salary_col,
-        "Desde": from_col or "No detectada; se usó Periodo",
-        "Hasta": to_col or "No detectada; se infirió con siguiente cambio o 31/12/2099",
-        "Periodo": period_col or "No detectada",
+        "Área de nómina": area_col or "No detectada; se completó con MD si existía",
+        "Salario": sal_col,
+        "Desde": from_col,
+        "Hasta": to_col,
     }
     return out, detected
 
 
-def standardize_param(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+def standardize_concepts_param(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     concept_col = find_column(df, CONCEPT_CANDIDATES + ["codigo", "código"])
     desc_col = find_column(df, CONCEPT_TEXT_CANDIDATES)
     prima_col = find_column(df, ["base prima", "prima", "aplica prima"])
     ces_col = find_column(df, ["base cesantias", "base cesantías", "cesantias", "cesantías", "aplica cesantias", "aplica cesantías"])
-    tipo_col = find_column(df, ["tipo", "tipo componente", "componente", "clasificacion", "clasificación"])
-
+    tipo_col = find_column(df, ["tipo base", "tipo_base", "tipo", "clasificacion", "clasificación"])
     if not concept_col:
-        raise ValueError("La parametrización debe tener una columna de Concepto / CC-nómina.")
+        raise ValueError("La parametrización de conceptos debe tener Concepto / CC-nómina.")
 
     out = pd.DataFrame()
     out["Concepto"] = df[concept_col].apply(extract_concept)
-    out["Descripción"] = df[desc_col].astype(str).str.strip() if desc_col else out["Concepto"]
-    out["Base_Prima"] = df[prima_col].apply(parse_bool) if prima_col else True
-    out["Base_Cesantias"] = df[ces_col].apply(parse_bool) if ces_col else True
-    out["Tipo_Componente"] = df[tipo_col].astype(str).str.strip() if tipo_col else "Variable acumulado"
+    out["Descripción"] = df[desc_col].astype(str).str.strip() if desc_col else ""
+    out["Base_Prima"] = df[prima_col].apply(safe_bool) if prima_col else True
+    out["Base_Cesantias"] = df[ces_col].apply(safe_bool) if ces_col else True
+    out["Tipo_Base"] = df[tipo_col].astype(str).str.upper().str.strip() if tipo_col else "VARIABLE_ACUMULADO"
+    out.loc[out["Concepto"].isin(FIXED_SALARY_CONCEPTS), "Tipo_Base"] = "SALARIO_FIJO_HISTORICO"
     out = out[out["Concepto"] != ""].drop_duplicates("Concepto", keep="last")
-
     detected = {
         "Concepto": concept_col,
         "Descripción": desc_col or "No detectada",
         "Base Prima": prima_col or "No detectada; se asumió Sí",
         "Base Cesantías": ces_col or "No detectada; se asumió Sí",
-        "Tipo componente": tipo_col or "No detectada; se asumió Variable acumulado",
+        "Tipo Base": tipo_col or "No detectada; salario fijo se identificó por Y010/Y011/Y020/Y050/Y051/Y090",
+    }
+    return out, detected
+
+
+def standardize_area_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    area_col = find_column(df, MD_AREA_CANDIDATES + ["area", "área"])
+    desc_col = find_column(df, ["descripcion", "descripción"])
+    rule_col = find_column(df, AREA_RULE_CANDIDATES)
+    monthly_col = find_column(df, MONTHLY_TO_CANDIDATES)
+    obs_col = find_column(df, ["observacion", "observación", "comentario"])
+    if not area_col:
+        raise ValueError("La parametrización de áreas debe tener columna Área de nómina.")
+
+    out = pd.DataFrame()
+    out["Área de nómina"] = df[area_col].apply(normalize_area)
+    out["Descripción"] = df[desc_col].astype(str).str.strip() if desc_col else ""
+    out["Regla_Dias"] = df[rule_col].astype(str).str.upper().str.strip() if rule_col else "DIAS_CALENDARIO"
+    out["Mensualizar_A"] = to_number_series(df[monthly_col]) if monthly_col else 30
+    out["Observación"] = df[obs_col].astype(str).str.strip() if obs_col else ""
+    out.loc[out["Regla_Dias"].str.contains("360", na=False), "Regla_Dias"] = "DIAS_360"
+    out.loc[~out["Regla_Dias"].str.contains("360", na=False), "Regla_Dias"] = "DIAS_CALENDARIO"
+    out.loc[out["Mensualizar_A"] <= 0, "Mensualizar_A"] = 30
+    out = out[out["Área de nómina"] != ""].drop_duplicates("Área de nómina", keep="last")
+    detected = {
+        "Área de nómina": area_col,
+        "Descripción": desc_col or "No detectada",
+        "Regla días": rule_col or "No detectada; se asumió calendario salvo parametrización default",
+        "Mensualizar a": monthly_col or "No detectada; se asumió 30",
+        "Observación": obs_col or "No detectada",
     }
     return out, detected
 
 # -----------------------------
-# Motor de cálculo
+# Cálculos principales
 # -----------------------------
 
-def build_population(md: Optional[pd.DataFrame], accum: pd.DataFrame, salary_hist: pd.DataFrame) -> pd.DataFrame:
-    if md is not None and not md.empty:
-        pop = md.copy()
+def build_population(accum: pd.DataFrame, salary_hist: pd.DataFrame, md_std: Optional[pd.DataFrame]) -> pd.DataFrame:
+    saps = sorted(set(accum["SAP"].astype(str)) | set(salary_hist["SAP"].astype(str)))
+    pop = pd.DataFrame({"SAP": saps})
+    if md_std is not None and not md_std.empty:
+        pop = pop.merge(md_std, on="SAP", how="left")
     else:
-        saps = sorted(set(accum["SAP"].dropna().astype(str)) | set(salary_hist["SAP"].dropna().astype(str)))
-        pop = pd.DataFrame({"SAP": saps})
         for col in ["Cédula", "Nombre", "Área de nómina", "CECO", "Cargo"]:
             pop[col] = ""
-        pop["Salario actual MD"] = 0.0
         pop["Fecha ingreso"] = pd.NaT
         pop["Fecha retiro"] = pd.NaT
 
-    extra_saps = sorted((set(accum["SAP"].astype(str)) | set(salary_hist["SAP"].astype(str))) - set(pop["SAP"].astype(str)))
-    if extra_saps:
-        extra = pd.DataFrame({"SAP": extra_saps})
-        for col in ["Cédula", "Nombre", "Área de nómina", "CECO", "Cargo"]:
-            extra[col] = ""
-        extra["Salario actual MD"] = 0.0
-        extra["Fecha ingreso"] = pd.NaT
-        extra["Fecha retiro"] = pd.NaT
-        pop = pd.concat([pop, extra], ignore_index=True)
-    return pop.drop_duplicates("SAP", keep="last")
+    # Completar área desde histórico si no existe en MD.
+    area_hist = salary_hist[salary_hist["Área de nómina"].astype(str).str.strip() != ""]
+    if not area_hist.empty:
+        last_area = area_hist.sort_values("Desde").drop_duplicates("SAP", keep="last")[["SAP", "Área de nómina"]]
+        pop = pop.merge(last_area.rename(columns={"Área de nómina": "Área histórico"}), on="SAP", how="left")
+        pop["Área de nómina"] = pop["Área de nómina"].fillna("")
+        pop["Área de nómina"] = pop["Área de nómina"].where(pop["Área de nómina"].astype(str).str.strip() != "", pop["Área histórico"].fillna(""))
+        pop = pop.drop(columns=["Área histórico"])
+    return pop
 
 
-def employee_divisor_days(population: pd.DataFrame, period_start: date, period_end: date, day_mode: str) -> pd.DataFrame:
-    rows = []
-    for _, r in population.iterrows():
-        sap = r["SAP"]
-        eff_start, eff_end = effective_window(period_start, period_end, r.get("Fecha ingreso", pd.NaT), r.get("Fecha retiro", pd.NaT))
-        days = count_days(eff_start, eff_end, day_mode) if eff_start and eff_end else 0
-        rows.append({
-            "SAP": sap,
-            "Inicio efectivo": eff_start,
-            "Fin efectivo": eff_end,
-            "Días divisor": days,
-        })
-    return pd.DataFrame(rows)
-
-
-def salary_average_for_period(
-    population: pd.DataFrame,
+def calc_salary_average(
     salary_hist: pd.DataFrame,
+    population: pd.DataFrame,
+    area_rules: pd.DataFrame,
     period_start: date,
     period_end: date,
-    day_mode: str,
     label: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Calcula salario mensual promedio usando histórico salarial y genera detalle por segmento."""
-    divisor = employee_divisor_days(population, period_start, period_end, day_mode)
-    salary_by_sap = {sap: g.sort_values(["Desde", "Hasta"]).copy() for sap, g in salary_hist.groupby("SAP")}
+    rows = []
+    for _, r in salary_hist.iterrows():
+        sap = r["SAP"]
+        area = normalize_area(r.get("Área de nómina", ""))
+        desde = r["Desde"]
+        hasta = r["Hasta"]
+        salario = float(r.get("Salario Vigencia", 0) or 0)
+        if pd.isna(desde) or salario <= 0:
+            continue
+        ini = max(period_start, desde.date())
+        fin_raw = hasta.date() if pd.notna(hasta) else date(9999, 12, 31)
+        fin = min(period_end, fin_raw)
+        if fin < ini:
+            continue
+        dias = area_days(ini, fin, area, area_rules)
+        if dias <= 0:
+            continue
+        rows.append(
+            {
+                "SAP": sap,
+                "Etiqueta": label,
+                "Área de nómina salario": area,
+                "Desde tramo": ini,
+                "Hasta tramo": fin,
+                "Salario Vigencia": salario,
+                "Días salario": dias,
+                "Salario x días": salario * dias,
+            }
+        )
 
-    summary_rows = []
-    segment_rows = []
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        out = population[["SAP"]].copy()
+        out[f"Salario histórico promedio {label}"] = 0.0
+        out[f"Días salario histórico {label}"] = 0
+        return out, detail
 
-    for _, pop in population.iterrows():
-        sap = pop["SAP"]
-        eff_start, eff_end = effective_window(period_start, period_end, pop.get("Fecha ingreso", pd.NaT), pop.get("Fecha retiro", pd.NaT))
-        div_days = count_days(eff_start, eff_end, day_mode) if eff_start and eff_end else 0
-
-        total_equiv = 0.0
-        covered_days = 0
-        missing_days = div_days
-        min_salary = None
-        max_salary = None
-        changes = 0
-
-        if not eff_start or not eff_end or div_days == 0:
-            status = "Sin días en periodo según ingreso/retiro"
-        else:
-            recs = salary_by_sap.get(sap)
-            if recs is None or recs.empty:
-                status = "Sin histórico salarial"
-            else:
-                points = {eff_start, eff_end + timedelta(days=1)}
-                usable_records = []
-                for _, rec in recs.iterrows():
-                    rec_start = as_date(rec["Desde"])
-                    rec_end = as_date(rec["Hasta"]) or MAX_SAFE_DATE
-                    if not rec_start:
-                        continue
-                    if rec_end < eff_start or rec_start > eff_end:
-                        continue
-                    usable_records.append(rec)
-                    points.add(max(eff_start, rec_start))
-                    if rec_end < eff_end:
-                        points.add(rec_end + timedelta(days=1))
-                points = sorted(points)
-
-                missing_days = 0
-                previous_salary = None
-                for i in range(len(points) - 1):
-                    seg_start = points[i]
-                    seg_end = points[i + 1] - timedelta(days=1)
-                    if seg_end < seg_start:
-                        continue
-                    days = count_days(seg_start, seg_end, day_mode)
-                    if days <= 0:
-                        continue
-                    matching = []
-                    for rec in usable_records:
-                        rec_start = as_date(rec["Desde"])
-                        rec_end = as_date(rec["Hasta"]) or MAX_SAFE_DATE
-                        if rec_start and rec_start <= seg_start <= rec_end:
-                            matching.append(rec)
-                    if not matching:
-                        missing_days += days
-                        segment_rows.append({
-                            "SAP": sap,
-                            "Prestación": label,
-                            "Segmento desde": seg_start,
-                            "Segmento hasta": seg_end,
-                            "Salario": 0.0,
-                            "Días segmento": days,
-                            "Valor salario equivalente": 0.0,
-                            "Estado segmento": "Sin salario para este tramo",
-                        })
-                        continue
-
-                    # Si hay traslape, se toma el registro con fecha Desde más reciente.
-                    chosen = sorted(matching, key=lambda x: as_date(x["Desde"]) or date(1900, 1, 1))[-1]
-                    sal = float(chosen["Salario"])
-                    val = sal / 30.0 * days
-                    total_equiv += val
-                    covered_days += days
-                    min_salary = sal if min_salary is None else min(min_salary, sal)
-                    max_salary = sal if max_salary is None else max(max_salary, sal)
-                    if previous_salary is not None and sal != previous_salary:
-                        changes += 1
-                    previous_salary = sal
-
-                    segment_rows.append({
-                        "SAP": sap,
-                        "Prestación": label,
-                        "Segmento desde": seg_start,
-                        "Segmento hasta": seg_end,
-                        "Salario": sal,
-                        "Días segmento": days,
-                        "Valor salario equivalente": val,
-                        "Estado segmento": "OK",
-                    })
-
-                if missing_days > 0:
-                    status = "Revisar: histórico salarial incompleto"
-                else:
-                    status = "OK"
-
-        avg_salary = total_equiv / div_days * 30 if div_days else 0.0
-        summary_rows.append({
-            "SAP": sap,
-            f"Días divisor {label}": div_days,
-            f"Días con salario histórico {label}": covered_days,
-            f"Días sin salario histórico {label}": missing_days,
-            f"Salario histórico acumulado equivalente {label}": total_equiv,
-            f"Salario histórico promedio {label}": avg_salary,
-            f"Salario mínimo histórico {label}": min_salary or 0.0,
-            f"Salario máximo histórico {label}": max_salary or 0.0,
-            f"Cambios salario detectados {label}": changes,
-            f"Estado salario histórico {label}": status,
-        })
-
-    return pd.DataFrame(summary_rows), pd.DataFrame(segment_rows)
+    grouped = detail.groupby("SAP", as_index=False).agg(
+        **{
+            f"Salario x días {label}": ("Salario x días", "sum"),
+            f"Días salario histórico {label}": ("Días salario", "sum"),
+            f"Tramos salario {label}": ("Salario Vigencia", "size"),
+        }
+    )
+    grouped[f"Salario histórico promedio {label}"] = (
+        grouped[f"Salario x días {label}"] / grouped[f"Días salario histórico {label}"].replace(0, pd.NA)
+    ).fillna(0.0)
+    return grouped, detail
 
 
-def accum_base_for_period(
+def calc_accum_average(
+    accum: pd.DataFrame,
     population: pd.DataFrame,
+    concepts: List[str],
+    period_start: date,
+    period_end: date,
+    label: str,
+    area_rules: pd.DataFrame,
+    only_variable: bool,
+    concept_param: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    concepts_set = set(concepts)
+    p_start_ts = pd.Timestamp(period_start.year, period_start.month, 1)
+    p_end_ts = pd.Timestamp(period_end.year, period_end.month, 1)
+
+    used = accum[
+        (accum["Periodo_Mes"] >= p_start_ts)
+        & (accum["Periodo_Mes"] <= p_end_ts)
+        & (accum["Concepto"].isin(concepts_set))
+    ].copy()
+
+    type_map = concept_param[["Concepto", "Tipo_Base"]].drop_duplicates("Concepto") if not concept_param.empty else pd.DataFrame(columns=["Concepto", "Tipo_Base"])
+    used = used.merge(type_map, on="Concepto", how="left")
+    used["Tipo_Base"] = used["Tipo_Base"].fillna("VARIABLE_ACUMULADO")
+    if only_variable:
+        used = used[used["Tipo_Base"] != "SALARIO_FIJO_HISTORICO"].copy()
+
+    if used.empty:
+        grouped = pd.DataFrame({"SAP": population["SAP"]})
+        grouped[f"Valor acumulado {'variable ' if only_variable else 'total '} {label}"] = 0.0
+        grouped[f"Meses con acumulado {'variable ' if only_variable else 'total '} {label}"] = 0
+        detail = used
+    else:
+        grouped = used.groupby("SAP", as_index=False).agg(
+            **{
+                f"Valor acumulado {'variable ' if only_variable else 'total '} {label}": ("Valor", "sum"),
+                f"Meses con acumulado {'variable ' if only_variable else 'total '} {label}": ("Periodo_Mes", lambda s: s.dt.strftime("%Y-%m").nunique()),
+            }
+        )
+        detail = used
+
+    out = population[["SAP", "Área de nómina"]].merge(grouped, on="SAP", how="left")
+    value_col = f"Valor acumulado {'variable ' if only_variable else 'total '} {label}"
+    months_col = f"Meses con acumulado {'variable ' if only_variable else 'total '} {label}"
+    out[value_col] = out[value_col].fillna(0.0)
+    out[months_col] = out[months_col].fillna(0).astype(int)
+
+    # Divisor por área de nómina. Para periodos completos full, esto equivale a /6 o /3 con base 30 cuando aplique.
+    out[f"Días divisor acumulados {label}"] = out["Área de nómina"].apply(lambda a: area_days(period_start, period_end, a, area_rules))
+    out[f"Meses divisor acumulados {label}"] = month_count_inclusive(period_start, period_end)
+    out[f"Promedio {'variable' if only_variable else 'total acumulado'} {label}"] = (
+        out[value_col] / out[f"Días divisor acumulados {label}"].replace(0, pd.NA) * 30
+    ).fillna(0.0)
+    return out.drop(columns=["Área de nómina"]), detail
+
+
+def calc_base_for_label(
+    label: str,
+    population: pd.DataFrame,
+    salary_hist: pd.DataFrame,
     accum: pd.DataFrame,
     concepts: List[str],
     period_start: date,
     period_end: date,
-    day_mode: str,
-    label: str,
-    output_prefix: str,
-) -> pd.DataFrame:
-    concepts_set = set(concepts)
-    start_month = pd.Timestamp(period_start.year, period_start.month, 1)
-    end_month = pd.Timestamp(period_end.year, period_end.month, 1)
-    divisor = employee_divisor_days(population, period_start, period_end, day_mode)
+    area_rules: pd.DataFrame,
+    concept_param: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    salary_avg, salary_detail = calc_salary_average(salary_hist, population, area_rules, period_start, period_end, label)
+    variable_avg, variable_detail = calc_accum_average(
+        accum, population, concepts, period_start, period_end, label, area_rules, True, concept_param
+    )
+    total_accum_avg, total_detail = calc_accum_average(
+        accum, population, concepts, period_start, period_end, label, area_rules, False, concept_param
+    )
 
-    used = accum[
-        (accum["Periodo_Mes"] >= start_month)
-        & (accum["Periodo_Mes"] <= end_month)
-        & (accum["Concepto"].isin(concepts_set))
-    ].copy()
+    base = population.merge(salary_avg, on="SAP", how="left").merge(variable_avg, on="SAP", how="left").merge(total_accum_avg, on="SAP", how="left")
 
-    if used.empty:
-        grouped = pd.DataFrame(columns=["SAP", f"Valor acumulado {output_prefix} {label}", f"Registros acumulados {output_prefix} {label}", f"Meses con acumulado {output_prefix} {label}"])
-    else:
-        grouped = used.groupby("SAP", as_index=False).agg(
-            **{
-                f"Valor acumulado {output_prefix} {label}": ("Valor", "sum"),
-                f"Registros acumulados {output_prefix} {label}": ("Valor", "size"),
-                f"Meses con acumulado {output_prefix} {label}": ("Periodo_Mes", lambda s: s.dt.strftime("%Y-%m").nunique()),
-            }
-        )
-
-    out = divisor.merge(grouped, on="SAP", how="left")
-    val_col = f"Valor acumulado {output_prefix} {label}"
-    reg_col = f"Registros acumulados {output_prefix} {label}"
-    mes_col = f"Meses con acumulado {output_prefix} {label}"
-    base_col = f"Base promedio {output_prefix} {label}"
-    out[val_col] = out[val_col].fillna(0.0)
-    out[reg_col] = out[reg_col].fillna(0).astype(int)
-    out[mes_col] = out[mes_col].fillna(0).astype(int)
-    div = out["Días divisor"].replace(0, pd.NA)
-    out[base_col] = (out[val_col] / div * 30).fillna(0.0)
-    return out[["SAP", val_col, reg_col, mes_col, base_col]]
-
-
-def compose_base_sheet(
-    population: pd.DataFrame,
-    salary_summary: pd.DataFrame,
-    accum_var: pd.DataFrame,
-    accum_sal: pd.DataFrame,
-    accum_total: pd.DataFrame,
-    period_start: date,
-    period_end: date,
-    label: str,
-    tolerance: float,
-) -> pd.DataFrame:
-    base = population.copy()
-    base = base.merge(salary_summary, on="SAP", how="left")
-    base = base.merge(accum_var, on="SAP", how="left")
-    base = base.merge(accum_sal, on="SAP", how="left")
-    base = base.merge(accum_total, on="SAP", how="left")
-
-    for c in base.columns:
-        if any(x in c for x in ["Valor acumulado", "Registros acumulados", "Meses con acumulado", "Base promedio", "Salario histórico", "Días con", "Días sin", "Días divisor", "Cambios salario", "Salario mínimo", "Salario máximo"]):
-            if c.startswith("Estado"):
-                continue
-            base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0.0)
-
+    sal_col = f"Salario histórico promedio {label}"
+    var_col = f"Promedio variable {label}"
+    total_col = f"Promedio total acumulado {label}"
+    base[sal_col] = base[sal_col].fillna(0.0)
+    base[var_col] = base[var_col].fillna(0.0)
+    base[total_col] = base[total_col].fillna(0.0)
+    base[f"Base calculada {label}"] = base[sal_col] + base[var_col]
+    base[f"Base SAP acumulada estimada {label}"] = base[total_col]
+    base[f"Diferencia vs acumulados {label}"] = base[f"Base calculada {label}"] - base[f"Base SAP acumulada estimada {label}"]
     base[f"Periodo inicial {label}"] = period_start.strftime("%d/%m/%Y")
     base[f"Periodo final {label}"] = period_end.strftime("%d/%m/%Y")
 
-    sal_prom = f"Salario histórico promedio {label}"
-    var_base = f"Base promedio variables acumuladas {label}"
-    sal_acc_base = f"Base promedio conceptos salariales acumulados {label}"
-    total_acc_base = f"Base promedio total acumulados {label}"
-
-    for col in [sal_prom, var_base, sal_acc_base, total_acc_base]:
-        if col not in base.columns:
-            base[col] = 0.0
-
-    base[f"Base final {label} histórico + acumulados"] = base[sal_prom] + base[var_base]
-    base[f"Validación base acumulada SAP {label}"] = base[total_acc_base]
-    base[f"Diferencia final vs acumulado SAP {label}"] = base[f"Base final {label} histórico + acumulados"] - base[f"Validación base acumulada SAP {label}"]
-    base[f"Diferencia salario histórico vs salario acumulado {label}"] = base[sal_prom] - base[sal_acc_base]
-
-    estado_sal = f"Estado salario histórico {label}"
-    base[f"Estado {label}"] = "OK"
-    if estado_sal in base.columns:
-        base.loc[base[estado_sal].astype(str).str.contains("Sin histórico", case=False, na=False), f"Estado {label}"] = "Revisar: sin histórico salarial"
-        base.loc[base[estado_sal].astype(str).str.contains("incompleto", case=False, na=False), f"Estado {label}"] = "Revisar: histórico salarial incompleto"
-    div_col = f"Días divisor {label}"
-    if div_col in base.columns:
-        base.loc[base[div_col] == 0, f"Estado {label}"] = "Sin días en periodo"
-    diff_col = f"Diferencia salario histórico vs salario acumulado {label}"
-    if diff_col in base.columns and sal_acc_base in base.columns:
-        mask_diff = (base[sal_acc_base].abs() > 0) & (base[diff_col].abs() > tolerance)
-        base.loc[mask_diff & (base[f"Estado {label}"] == "OK"), f"Estado {label}"] = "Revisar: diferencia salario histórico vs acumulado"
+    status = []
+    for _, r in base.iterrows():
+        notes = []
+        if float(r.get(sal_col, 0) or 0) == 0:
+            notes.append("Sin salario histórico en periodo")
+        if str(r.get("Área de nómina", "")).strip() == "":
+            notes.append("Sin área de nómina para aplicar regla")
+        if float(r.get(f"Días salario histórico {label}", 0) or 0) == 0:
+            notes.append("Sin días de salario histórico")
+        if not notes:
+            notes.append("OK")
+        status.append(" | ".join(notes))
+    base[f"Estado {label}"] = status
 
     ordered = [
-        "SAP", "Cédula", "Nombre", "Área de nómina", "CECO", "Cargo", "Salario actual MD",
-        "Fecha ingreso", "Fecha retiro", f"Periodo inicial {label}", f"Periodo final {label}",
-        f"Días divisor {label}", f"Días con salario histórico {label}", f"Días sin salario histórico {label}",
-        f"Salario histórico acumulado equivalente {label}", f"Salario histórico promedio {label}",
-        f"Salario mínimo histórico {label}", f"Salario máximo histórico {label}", f"Cambios salario detectados {label}",
-        f"Valor acumulado variables acumuladas {label}", f"Base promedio variables acumuladas {label}",
-        f"Valor acumulado conceptos salariales acumulados {label}", f"Base promedio conceptos salariales acumulados {label}",
-        f"Valor acumulado total acumulados {label}", f"Base promedio total acumulados {label}",
-        f"Base final {label} histórico + acumulados", f"Validación base acumulada SAP {label}",
-        f"Diferencia final vs acumulado SAP {label}", f"Diferencia salario histórico vs salario acumulado {label}",
-        f"Estado salario histórico {label}", f"Estado {label}",
+        "SAP", "Cédula", "Nombre", "Área de nómina", "CECO", "Cargo", "Fecha ingreso", "Fecha retiro",
+        f"Periodo inicial {label}", f"Periodo final {label}",
+        sal_col, f"Días salario histórico {label}", f"Tramos salario {label}",
+        f"Valor acumulado variable  {label}", f"Meses con acumulado variable  {label}",
+        f"Promedio variable {label}",
+        f"Valor acumulado total  {label}", f"Meses con acumulado total  {label}",
+        f"Promedio total acumulado {label}",
+        f"Base calculada {label}", f"Base SAP acumulada estimada {label}", f"Diferencia vs acumulados {label}",
+        f"Estado {label}",
     ]
-    existing = [c for c in ordered if c in base.columns]
-    rest = [c for c in base.columns if c not in existing]
-    return base[existing + rest]
+    # Nombres generados tienen doble espacio por el sufijo usado; normalizar visualmente.
+    rename_map = {
+        f"Valor acumulado variable  {label}": f"Valor acumulado variable {label}",
+        f"Meses con acumulado variable  {label}": f"Meses con acumulado variable {label}",
+        f"Valor acumulado total  {label}": f"Valor acumulado total {label}",
+        f"Meses con acumulado total  {label}": f"Meses con acumulado total {label}",
+    }
+    base = base.rename(columns=rename_map)
+    ordered = [rename_map.get(c, c) for c in ordered]
+    return base[[c for c in ordered if c in base.columns]], salary_detail, variable_detail
 
 
-def build_concepts_table(accum: pd.DataFrame, prima_concepts: List[str], ces_concepts: List[str], salary_concepts: List[str]) -> pd.DataFrame:
-    concepts = accum.groupby(["Concepto", "Texto Concepto"], as_index=False).agg(
-        Valor_Total_Archivo=("Valor", "sum"),
-        Registros=("Valor", "size"),
-        Primer_Periodo=("Periodo_Mes", "min"),
-        Ultimo_Periodo=("Periodo_Mes", "max"),
-    ).sort_values(["Concepto", "Texto Concepto"])
-    concepts["Primer_Periodo"] = concepts["Primer_Periodo"].dt.strftime("%Y-%m")
-    concepts["Ultimo_Periodo"] = concepts["Ultimo_Periodo"].dt.strftime("%Y-%m")
-    concepts["Usado_Base_Prima"] = concepts["Concepto"].isin(prima_concepts)
-    concepts["Usado_Base_Cesantias"] = concepts["Concepto"].isin(ces_concepts)
-    concepts["Concepto_Salarial_Validado_por_Historico"] = concepts["Concepto"].isin(salary_concepts)
-    concepts["Tratamiento"] = concepts["Concepto_Salarial_Validado_por_Historico"].map(lambda x: "Salario histórico" if x else "Acumulado variable")
-    return concepts
-
-
-def build_detail_used(
-    accum: pd.DataFrame,
-    prima_concepts: List[str],
-    ces_concepts: List[str],
-    salary_concepts: List[str],
-    prima_start: date,
-    prima_end: date,
-    ces_start: date,
-    ces_end: date,
-) -> pd.DataFrame:
+def build_detail_accum(accum: pd.DataFrame, concept_param: pd.DataFrame, prima_concepts: List[str], ces_concepts: List[str], prima_start: date, prima_end: date, ces_start: date, ces_end: date) -> pd.DataFrame:
     detail = accum.copy()
+    detail = detail.merge(concept_param[["Concepto", "Base_Prima", "Base_Cesantias", "Tipo_Base"]], on="Concepto", how="left")
+    detail["Base_Prima"] = detail["Base_Prima"].fillna(False)
+    detail["Base_Cesantias"] = detail["Base_Cesantias"].fillna(False)
+    detail["Tipo_Base"] = detail["Tipo_Base"].fillna("NO_PARAMETRIZADO")
     detail["Periodo"] = detail["Periodo_Mes"].dt.strftime("%Y-%m")
-    detail["Concepto salarial histórico"] = detail["Concepto"].isin(salary_concepts)
-    detail["En periodo prima"] = (detail["Periodo_Mes"] >= pd.Timestamp(prima_start.year, prima_start.month, 1)) & (detail["Periodo_Mes"] <= pd.Timestamp(prima_end.year, prima_end.month, 1))
-    detail["En periodo cesantías"] = (detail["Periodo_Mes"] >= pd.Timestamp(ces_start.year, ces_start.month, 1)) & (detail["Periodo_Mes"] <= pd.Timestamp(ces_end.year, ces_end.month, 1))
-    detail["Usado prima total"] = detail["En periodo prima"] & detail["Concepto"].isin(prima_concepts)
-    detail["Usado prima variable"] = detail["Usado prima total"] & (~detail["Concepto salarial histórico"])
-    detail["Usado prima salarial validación"] = detail["Usado prima total"] & detail["Concepto salarial histórico"]
-    detail["Usado cesantías total"] = detail["En periodo cesantías"] & detail["Concepto"].isin(ces_concepts)
-    detail["Usado cesantías variable"] = detail["Usado cesantías total"] & (~detail["Concepto salarial histórico"])
-    detail["Usado cesantías salarial validación"] = detail["Usado cesantías total"] & detail["Concepto salarial histórico"]
+    detail["Usado_Prima"] = (
+        (detail["Periodo_Mes"] >= pd.Timestamp(prima_start.year, prima_start.month, 1))
+        & (detail["Periodo_Mes"] <= pd.Timestamp(prima_end.year, prima_end.month, 1))
+        & (detail["Concepto"].isin(prima_concepts))
+    )
+    detail["Usado_Cesantias"] = (
+        (detail["Periodo_Mes"] >= pd.Timestamp(ces_start.year, ces_start.month, 1))
+        & (detail["Periodo_Mes"] <= pd.Timestamp(ces_end.year, ces_end.month, 1))
+        & (detail["Concepto"].isin(ces_concepts))
+    )
     cols = [
-        "SAP", "Concepto", "Texto Concepto", "Valor", "Cantidad", "Periodo", "Periodo original",
-        "Concepto salarial histórico", "En periodo prima", "Usado prima total", "Usado prima variable", "Usado prima salarial validación",
-        "En periodo cesantías", "Usado cesantías total", "Usado cesantías variable", "Usado cesantías salarial validación",
+        "SAP", "Periodo", "Periodo_Original", "Concepto", "Texto Concepto", "Valor", "Cantidad",
+        "Tipo_Base", "Base_Prima", "Base_Cesantias", "Usado_Prima", "Usado_Cesantias",
     ]
     return detail[cols]
 
 
-def build_alerts(base_prima: pd.DataFrame, base_ces: pd.DataFrame, tolerance: float) -> pd.DataFrame:
+def build_alerts(base_prima: pd.DataFrame, base_ces: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for label, df in [("Prima", base_prima), ("Cesantias", base_ces)]:
-        estado_col = f"Estado {label}"
-        diff_col = f"Diferencia salario histórico vs salario acumulado {label}"
-        if estado_col not in df.columns:
-            continue
-        subset = df[df[estado_col] != "OK"].copy()
-        for _, r in subset.iterrows():
-            rows.append({
-                "SAP": r.get("SAP", ""),
-                "Nombre": r.get("Nombre", ""),
-                "Prestación": label,
-                "Alerta": r.get(estado_col, ""),
-                "Diferencia salario histórico vs acumulado": r.get(diff_col, 0),
-                "Tolerancia usada": tolerance,
-            })
+    for df, label in [(base_prima, "Prima"), (base_ces, "Cesantias")]:
+        status_col = f"Estado {label}"
+        diff_col = f"Diferencia vs acumulados {label}"
+        base_col = f"Base calculada {label}"
+        for _, r in df.iterrows():
+            estado = str(r.get(status_col, ""))
+            diff = float(r.get(diff_col, 0) or 0)
+            base = float(r.get(base_col, 0) or 0)
+            pct = abs(diff) / abs(base) if base else 0
+            if estado != "OK" or abs(diff) >= 1000 and pct >= 0.01:
+                rows.append({
+                    "SAP": r.get("SAP", ""),
+                    "Nombre": r.get("Nombre", ""),
+                    "Área de nómina": r.get("Área de nómina", ""),
+                    "Base": label,
+                    "Estado": estado,
+                    "Base calculada": base,
+                    "Diferencia": diff,
+                    "% Diferencia": pct,
+                })
     return pd.DataFrame(rows)
 
 
+def make_template_bytes() -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        DEFAULT_CONCEPTS.to_excel(writer, index=False, sheet_name="Conceptos")
+        DEFAULT_AREA_RULES.to_excel(writer, index=False, sheet_name="Areas")
+    return output.getvalue()
+
+
 def make_excel_report(
+    llevar_modelo: pd.DataFrame,
     base_prima: pd.DataFrame,
     base_ces: pd.DataFrame,
-    llevar_modelo: pd.DataFrame,
-    detail: pd.DataFrame,
-    salary_segments: pd.DataFrame,
-    concepts: pd.DataFrame,
+    detail_accum: pd.DataFrame,
+    sal_detail: pd.DataFrame,
+    concept_param: pd.DataFrame,
+    area_rules: pd.DataFrame,
     alerts: pd.DataFrame,
     log_df: pd.DataFrame,
 ) -> bytes:
@@ -964,9 +896,10 @@ def make_excel_report(
             "Llevar_al_Modelo": llevar_modelo,
             "Base_Prima": base_prima,
             "Base_Cesantias": base_ces,
-            "Detalle_Acumulados": detail,
-            "Historico_Salarios_Calculo": salary_segments,
-            "Conceptos_Usados": concepts,
+            "Detalle_Acumulados": detail_accum,
+            "Historico_Salarios_Calculo": sal_detail,
+            "Param_Conceptos": concept_param,
+            "Param_Areas": area_rules,
             "Alertas": alerts,
             "Log": log_df,
         }
@@ -974,386 +907,291 @@ def make_excel_report(
         header_fmt = workbook.add_format({"bold": True, "bg_color": "#F4B183", "border": 1})
         money_fmt = workbook.add_format({"num_format": "#,##0.00"})
         int_fmt = workbook.add_format({"num_format": "#,##0"})
-        date_fmt = workbook.add_format({"num_format": "dd/mm/yyyy"})
         pct_fmt = workbook.add_format({"num_format": "0.00%"})
+        date_fmt = workbook.add_format({"num_format": "dd/mm/yyyy"})
 
         for sheet_name, df in sheets.items():
             safe_name = sheet_name[:31]
-            df_to_write = df.copy()
-            for col in df_to_write.columns:
-                if pd.api.types.is_datetime64_any_dtype(df_to_write[col]):
-                    df_to_write[col] = df_to_write[col].dt.date
-            df_to_write.to_excel(writer, index=False, sheet_name=safe_name)
+            if df is None or df.empty:
+                df = pd.DataFrame({"Sin registros": []})
+            df.to_excel(writer, index=False, sheet_name=safe_name)
             ws = writer.sheets[safe_name]
             ws.freeze_panes(1, 0)
-            if len(df_to_write.columns) > 0:
-                ws.autofilter(0, 0, max(len(df_to_write), 1), len(df_to_write.columns) - 1)
-            for col_idx, col_name in enumerate(df_to_write.columns):
+            ws.autofilter(0, 0, max(len(df), 1), max(len(df.columns) - 1, 0))
+            for col_idx, col_name in enumerate(df.columns):
                 ws.write(0, col_idx, col_name, header_fmt)
-                width = min(max(len(str(col_name)) + 2, 12), 48)
-                if not df_to_write.empty:
-                    try:
-                        sample = df_to_write[col_name].astype(str).head(300).map(len).max()
-                        width = min(max(width, int(sample) + 2), 48)
-                    except Exception:
-                        pass
+                width = min(max(len(str(col_name)) + 2, 12), 50)
+                if not df.empty:
+                    sample = df[col_name].astype(str).head(200).map(len).max()
+                    width = min(max(width, int(sample) + 2), 50)
                 lower = str(col_name).lower()
                 fmt = None
-                if any(k in lower for k in ["valor", "base", "salario", "promedio", "acumulado", "diferencia", "tolerancia"]):
+                if any(k in lower for k in ["valor", "base", "salario", "promedio", "acumulado", "diferencia"]):
                     fmt = money_fmt
-                elif any(k in lower for k in ["dias", "días", "meses", "registros", "cambios"]):
+                elif any(k in lower for k in ["dias", "días", "meses", "tramos"]):
                     fmt = int_fmt
-                elif "fecha" in lower or "desde" in lower or "hasta" in lower or "inicio" in lower or "fin" in lower:
-                    fmt = date_fmt
-                elif "%" in lower or "porcentaje" in lower:
+                elif "%" in lower:
                     fmt = pct_fmt
+                elif "fecha" in lower or "desde" in lower or "hasta" in lower:
+                    fmt = date_fmt
                 ws.set_column(col_idx, col_idx, width, fmt)
     return output.getvalue()
 
-
-def make_param_template() -> bytes:
-    df = pd.DataFrame({
-        "Concepto": sorted(DEFAULT_BASE_PRESTACIONES),
-        "Descripción": "",
-        "Base_Prima": "Sí",
-        "Base_Cesantías": "Sí",
-        "Tipo_Componente": ["Salario histórico" if c in SALARY_CONCEPTS_DEFAULT else "Variable acumulado" for c in sorted(DEFAULT_BASE_PRESTACIONES)],
-    })
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Parametrizacion")
-    return output.getvalue()
-
-
-def default_semester_dates(today: date) -> Tuple[date, date]:
-    if today.month <= 6:
-        return date(today.year, 1, 1), date(today.year, 6, 30)
-    return date(today.year, 7, 1), date(today.year, 12, 31)
-
 # -----------------------------
-# Interfaz
+# UI
 # -----------------------------
 
 st.title("🦜 Validador de bases de prima y cesantías")
-st.caption("Solo acumulados históricos + ejercicio de histórico salarial. No calcula proyección.")
+st.caption("Modelo financiero nómina · Acumulados históricos + histórico de salarios · Sin proyección")
 
-with st.expander("📌 ¿Qué hace esta versión?", expanded=True):
+with st.expander("📌 Qué hace esta versión", expanded=True):
     st.markdown(
         """
-        Esta herramienta está pensada para **validar la base prestacional**, no para proyectar nómina.
+        Esta versión **no toma pagado del mes de proyección** ni calcula proyección.  
+        Hace la validación de la base así:
 
-        **Lógica aplicada:**
-        1. Lee los **acumulados históricos** por empleado, concepto y periodo.
-        2. Lee el **histórico de salarios** y arma el salario promedio del periodo según vigencias.
-        3. Separa los conceptos salariales, como Y010/Y011/Y020/Y050/Y051/Y090, para no duplicarlos si ya se calculan por histórico.
-        4. Calcula variables acumuladas promedio con la fórmula: `valor acumulado / días divisor × 30`.
-        5. Genera la base final: **salario histórico promedio + variables acumuladas promedio**.
-        6. Deja una validación contra lo acumulado en SAP para identificar diferencias.
+        **Base calculada = salario histórico promedio por vigencias + variables promedio de acumulados.**
+
+        El salario fijo sale del **histórico de salarios**. Por eso los conceptos `Y010`, `Y011`, `Y020`, `Y050`, `Y051` y `Y090` se tratan como salario fijo histórico y no se duplican dentro de las variables acumuladas.
         """
     )
 
 with st.sidebar:
     st.header("⚙️ Parámetros")
-    today = date.today()
-    def_prima_ini, def_prima_fin = default_semester_dates(today)
-    def_ces_ini = date(today.year, 1, 1)
-    def_ces_fin = today
+    corte = st.date_input("Fecha de corte de validación", value=date.today().replace(day=1) - timedelta(days=1))
 
-    prima_start = st.date_input("Inicio periodo prima", value=def_prima_ini, format="DD/MM/YYYY")
-    prima_end = st.date_input("Fin periodo prima", value=def_prima_fin, format="DD/MM/YYYY")
-    ces_start = st.date_input("Inicio periodo cesantías", value=def_ces_ini, format="DD/MM/YYYY")
-    ces_end = st.date_input("Fin periodo cesantías", value=def_ces_fin, format="DD/MM/YYYY")
-
-    day_mode = st.selectbox(
-        "Días divisor",
-        ["Días 360 nómina", "Días calendario reales"],
-        index=0,
-        help="Para nómina Colombia normalmente se usa base 360. El salario histórico se divide en salario/30 por días del tramo.",
-    )
-    tolerance = st.number_input("Tolerancia para alerta de diferencia", min_value=0.0, value=1000.0, step=1000.0)
+    st.caption("Periodos automáticos sugeridos")
+    use_auto = st.checkbox("Usar últimos 6 meses para prima y últimos 3 meses para cesantías", value=True)
+    if use_auto:
+        corte_month_first = date(corte.year, corte.month, 1)
+        prima_start = add_months(corte_month_first, -5)
+        prima_end = month_last_day(corte_month_first)
+        ces_start = add_months(corte_month_first, -2)
+        ces_end = month_last_day(corte_month_first)
+    else:
+        prima_start = st.date_input("Inicio periodo prima", value=add_months(date(corte.year, corte.month, 1), -5))
+        prima_end = st.date_input("Fin periodo prima", value=corte)
+        ces_start = st.date_input("Inicio periodo cesantías", value=add_months(date(corte.year, corte.month, 1), -2))
+        ces_end = st.date_input("Fin periodo cesantías", value=corte)
 
     st.download_button(
-        "⬇️ Descargar plantilla parametrización",
-        data=make_param_template(),
-        file_name="plantilla_parametrizacion_prima_cesantias.xlsx",
+        "⬇️ Descargar plantilla de parametrización",
+        data=make_template_bytes(),
+        file_name="plantilla_parametrizacion_bases_prima_cesantias.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 st.subheader("1) Carga de archivos")
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    accum_file = st.file_uploader("Acumulados de nómina", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"], key="accum")
-with c2:
-    salary_file = st.file_uploader("Histórico de salarios", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"], key="salary")
-with c3:
-    md_file = st.file_uploader("Master Data / empleados (opcional)", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"], key="md")
-with c4:
-    param_file = st.file_uploader("Parametrización conceptos (opcional)", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"], key="param")
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    accum_file = st.file_uploader("Acumulados de nómina", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"])
+with col2:
+    salary_file = st.file_uploader("Histórico de salarios", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"])
+with col3:
+    md_file = st.file_uploader("Master Data / empleados (opcional)", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"])
+with col4:
+    param_file = st.file_uploader("Parametrización conceptos/áreas (opcional)", type=["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "txt"])
 
-# Selección de hojas
-accum_sheet = salary_sheet = md_sheet = param_sheet = None
-if accum_file:
-    try:
-        sheets = get_sheet_names(accum_file)
-        accum_sheet = st.selectbox("Hoja acumulados", sheets, key="accum_sheet") if len(sheets) > 1 else sheets[0]
-    except Exception as exc:
-        st.error(f"No pude leer las hojas de acumulados: {exc}")
-if salary_file:
-    try:
-        sheets = get_sheet_names(salary_file)
-        salary_sheet = st.selectbox("Hoja histórico salarios", sheets, key="salary_sheet") if len(sheets) > 1 else sheets[0]
-    except Exception as exc:
-        st.error(f"No pude leer las hojas del histórico de salarios: {exc}")
-if md_file:
-    try:
-        sheets = get_sheet_names(md_file)
-        md_sheet = st.selectbox("Hoja Master Data", sheets, key="md_sheet") if len(sheets) > 1 else sheets[0]
-    except Exception as exc:
-        st.warning(f"No pude leer las hojas de Master Data: {exc}")
-if param_file:
-    try:
-        sheets = get_sheet_names(param_file)
-        param_sheet = st.selectbox("Hoja parametrización", sheets, key="param_sheet") if len(sheets) > 1 else sheets[0]
-    except Exception as exc:
-        st.warning(f"No pude leer las hojas de parametrización: {exc}")
 
-# Lectura de insumos
-accum_std = salary_std = md_std = param_std = None
+def sheet_selector(file, key):
+    if not file:
+        return None
+    try:
+        sheets = get_sheet_names(file)
+        return st.selectbox(f"Hoja {key}", sheets, key=f"sheet_{key}") if len(sheets) > 1 else sheets[0]
+    except Exception as exc:
+        st.error(f"No pude leer hojas de {key}: {exc}")
+        return None
+
+accum_sheet = sheet_selector(accum_file, "acumulados")
+salary_sheet = sheet_selector(salary_file, "histórico salarios")
+md_sheet = sheet_selector(md_file, "MD")
+param_sheet = sheet_selector(param_file, "parametrización")
+
 read_log = []
+accum_std = None
+salary_std = None
+md_std = None
+concept_param = DEFAULT_CONCEPTS.copy()
+area_rules = DEFAULT_AREA_RULES.copy()
+
+if md_file and md_sheet:
+    try:
+        md_raw = read_uploaded_table(md_file, md_sheet)
+        md_std, md_detected = standardize_md(md_raw)
+        read_log.append({"Paso": "Master Data", "Resultado": f"OK - {len(md_std):,} empleados", "Detalle": str(md_detected)})
+        st.success(f"Master Data leído: {len(md_std):,} empleados")
+        with st.expander("Columnas detectadas en MD"):
+            st.json(md_detected)
+    except Exception as exc:
+        st.warning(f"No se usará MD: {exc}")
+        md_std = None
 
 if accum_file and accum_sheet:
     try:
-        raw = read_uploaded_table(accum_file, accum_sheet)
-        accum_std, detected = standardize_accumulated(raw)
-        read_log.append({"Paso": "Acumulados", "Resultado": f"OK - {len(accum_std):,} registros", "Detalle": str(detected)})
+        accum_raw = read_uploaded_table(accum_file, accum_sheet)
+        accum_std, accum_detected = standardize_accumulated(accum_raw)
+        read_log.append({"Paso": "Acumulados", "Resultado": f"OK - {len(accum_std):,} registros", "Detalle": str(accum_detected)})
         st.success(f"Acumulados leídos: {len(accum_std):,} registros")
         with st.expander("Columnas detectadas en acumulados"):
-            st.json(detected)
+            st.json(accum_detected)
     except Exception as exc:
         st.error(f"Error leyendo acumulados: {exc}")
 
 if salary_file and salary_sheet:
     try:
-        raw = read_uploaded_table(salary_file, salary_sheet)
-        salary_std, detected = standardize_salary_history(raw)
-        read_log.append({"Paso": "Histórico salarios", "Resultado": f"OK - {len(salary_std):,} registros", "Detalle": str(detected)})
-        st.success(f"Histórico de salarios leído: {len(salary_std):,} registros")
+        salary_raw = read_uploaded_table(salary_file, salary_sheet)
+        salary_std, salary_detected = standardize_salary_history(salary_raw, md_std)
+        read_log.append({"Paso": "Histórico salarios", "Resultado": f"OK - {len(salary_std):,} vigencias", "Detalle": str(salary_detected)})
+        st.success(f"Histórico de salarios leído: {len(salary_std):,} vigencias")
         with st.expander("Columnas detectadas en histórico de salarios"):
-            st.json(detected)
+            st.json(salary_detected)
     except Exception as exc:
         st.error(f"Error leyendo histórico de salarios: {exc}")
 
-if md_file and md_sheet:
-    try:
-        raw = read_uploaded_table(md_file, md_sheet)
-        md_std, detected = standardize_md(raw)
-        read_log.append({"Paso": "Master Data", "Resultado": f"OK - {len(md_std):,} empleados", "Detalle": str(detected)})
-        st.success(f"Master Data leído: {len(md_std):,} empleados")
-        with st.expander("Columnas detectadas en Master Data"):
-            st.json(detected)
-    except Exception as exc:
-        st.warning(f"No se usará Master Data porque ocurrió un error: {exc}")
-
 if param_file and param_sheet:
     try:
-        raw = read_uploaded_table(param_file, param_sheet)
-        param_std, detected = standardize_param(raw)
-        read_log.append({"Paso": "Parametrización", "Resultado": f"OK - {len(param_std):,} conceptos", "Detalle": str(detected)})
-        st.success(f"Parametrización leída: {len(param_std):,} conceptos")
-        with st.expander("Columnas detectadas en parametrización"):
-            st.json(detected)
+        param_raw = read_uploaded_table(param_file, param_sheet)
+        # El mismo archivo puede traer una hoja de conceptos o áreas. Si la hoja elegida parece áreas, carga áreas; si no, conceptos.
+        try:
+            param_area, area_detected = standardize_area_rules(param_raw)
+            if set(param_area["Área de nómina"].dropna()) & {"ZM", "ZL", "ZH", "ZP"}:
+                area_rules = pd.concat([DEFAULT_AREA_RULES, param_area], ignore_index=True).drop_duplicates("Área de nómina", keep="last")
+                read_log.append({"Paso": "Param áreas", "Resultado": f"OK - {len(area_rules):,} reglas", "Detalle": str(area_detected)})
+                st.success("Parametrización de áreas cargada")
+        except Exception:
+            pass
+        try:
+            param_concepts, concept_detected = standardize_concepts_param(param_raw)
+            if not param_concepts.empty:
+                concept_param = pd.concat([DEFAULT_CONCEPTS, param_concepts], ignore_index=True).drop_duplicates("Concepto", keep="last")
+                read_log.append({"Paso": "Param conceptos", "Resultado": f"OK - {len(concept_param):,} conceptos", "Detalle": str(concept_detected)})
+                st.success("Parametrización de conceptos cargada")
+        except Exception:
+            pass
     except Exception as exc:
-        st.warning(f"No se usará parametrización porque ocurrió un error: {exc}")
+        st.warning(f"No se usó parametrización cargada: {exc}")
+
+st.subheader("2) Parametrización aplicada")
+pa, pc = st.columns(2)
+with pa:
+    st.markdown("**Reglas por área de nómina**")
+    area_rules = st.data_editor(area_rules, use_container_width=True, num_rows="dynamic")
+with pc:
+    st.markdown("**Conceptos para prima y cesantías**")
+    concept_param = st.data_editor(concept_param, use_container_width=True, num_rows="dynamic")
 
 if accum_std is not None and salary_std is not None:
-    st.subheader("2) Conceptos y tratamiento")
+    st.subheader("3) Validación antes de generar")
+    prima_concepts = sorted(concept_param.loc[concept_param["Base_Prima"].astype(bool), "Concepto"].dropna().apply(extract_concept).unique().tolist())
+    ces_concepts = sorted(concept_param.loc[concept_param["Base_Cesantias"].astype(bool), "Concepto"].dropna().apply(extract_concept).unique().tolist())
 
-    concept_catalog = accum_std.groupby(["Concepto", "Texto Concepto"], as_index=False).agg(
-        Valor_Total=("Valor", "sum"),
-        Registros=("Valor", "size"),
-        Primer_Periodo=("Periodo_Mes", "min"),
-        Ultimo_Periodo=("Periodo_Mes", "max"),
-    ).sort_values("Concepto")
-    concept_catalog["Primer_Periodo"] = concept_catalog["Primer_Periodo"].dt.strftime("%Y-%m")
-    concept_catalog["Ultimo_Periodo"] = concept_catalog["Ultimo_Periodo"].dt.strftime("%Y-%m")
-
-    all_concepts = sorted(concept_catalog["Concepto"].dropna().unique().tolist())
-
-    if param_std is not None and not param_std.empty:
-        prima_default = sorted(param_std.loc[param_std["Base_Prima"], "Concepto"].unique().tolist())
-        ces_default = sorted(param_std.loc[param_std["Base_Cesantias"], "Concepto"].unique().tolist())
-        salary_default = sorted(
-            set(param_std.loc[param_std["Tipo_Componente"].apply(lambda x: "salario" in normalize_text(x)), "Concepto"].unique().tolist())
-            | (set(all_concepts) & SALARY_CONCEPTS_DEFAULT)
-        )
-        st.info("Se tomó la parametrización cargada. Puedes ajustar los conceptos antes de generar.")
-    else:
-        prima_default = [c for c in all_concepts if c in DEFAULT_BASE_PRESTACIONES or c.startswith("Y")]
-        ces_default = [c for c in all_concepts if c in DEFAULT_BASE_PRESTACIONES or c.startswith("Y")]
-        salary_default = [c for c in all_concepts if c in SALARY_CONCEPTS_DEFAULT]
-        st.warning("No cargaste parametrización. Se preseleccionaron conceptos Y y los salariales conocidos para validar contra histórico.")
-
-    a, b = st.columns(2)
-    with a:
-        prima_concepts = st.multiselect("Conceptos que aplican para base de prima", all_concepts, default=[c for c in prima_default if c in all_concepts])
-    with b:
-        ces_concepts = st.multiselect("Conceptos que aplican para base de cesantías", all_concepts, default=[c for c in ces_default if c in all_concepts])
-
-    salary_concepts = st.multiselect(
-        "Conceptos salariales que se validan con histórico de salarios",
-        all_concepts,
-        default=[c for c in salary_default if c in all_concepts],
-        help="Estos conceptos no se suman como variable si estás usando el histórico salarial. Se usan para comparar contra SAP.",
-    )
-
-    with st.expander("Ver catálogo de conceptos detectados"):
-        st.dataframe(concept_catalog, use_container_width=True)
-
-    st.subheader("3) Validación de periodos")
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
         st.metric("Periodo prima", f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}")
-    with k2:
+    with c2:
         st.metric("Periodo cesantías", f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}")
-    with k3:
-        st.metric("Conceptos prima", f"{len(prima_concepts):,}")
-    with k4:
-        st.metric("Conceptos cesantías", f"{len(ces_concepts):,}")
+    with c3:
+        st.metric("Conceptos prima", len(prima_concepts))
+    with c4:
+        st.metric("Conceptos cesantías", len(ces_concepts))
 
-    periods_summary = accum_std.groupby(accum_std["Periodo_Mes"].dt.strftime("%Y-%m"), as_index=True).agg(
-        Registros=("Valor", "size"),
-        Valor=("Valor", "sum"),
-    ).reset_index().rename(columns={"Periodo_Mes": "Periodo"})
+    periods_summary = (
+        accum_std.groupby(accum_std["Periodo_Mes"].dt.strftime("%Y-%m"), as_index=True)
+        .agg(Registros=("Valor", "size"), Valor=("Valor", "sum"))
+        .reset_index()
+        .rename(columns={"Periodo_Mes": "Periodo"})
+    )
     with st.expander("Periodos encontrados en acumulados"):
         st.dataframe(periods_summary, use_container_width=True)
+    with st.expander("Conceptos encontrados en acumulados"):
+        catalog = accum_std.groupby(["Concepto", "Texto Concepto"], as_index=False).agg(Valor_Total=("Valor", "sum"), Registros=("Valor", "size"))
+        catalog = catalog.merge(concept_param[["Concepto", "Base_Prima", "Base_Cesantias", "Tipo_Base"]], on="Concepto", how="left")
+        st.dataframe(catalog, use_container_width=True)
 
-    salary_periods = salary_std.copy()
-    salary_periods["Desde"] = salary_periods["Desde"].dt.strftime("%d/%m/%Y")
-    salary_periods["Hasta"] = salary_periods["Hasta"].dt.strftime("%d/%m/%Y")
-    with st.expander("Vista rápida del histórico de salarios"):
-        st.dataframe(salary_periods.head(300), use_container_width=True)
-
-    generate = st.button("🚀 Generar bases de prima y cesantías", type="primary")
+    generate = st.button("🚀 Generar validación de bases", type="primary")
 
     if generate:
-        if prima_end < prima_start:
-            st.error("Revisa el periodo de prima: la fecha final no puede ser menor que la inicial.")
+        if prima_end < prima_start or ces_end < ces_start:
+            st.error("Revisa los periodos: la fecha final no puede ser menor que la inicial.")
             st.stop()
-        if ces_end < ces_start:
-            st.error("Revisa el periodo de cesantías: la fecha final no puede ser menor que la inicial.")
-            st.stop()
-        if not prima_concepts:
-            st.error("Selecciona al menos un concepto para prima.")
-            st.stop()
-        if not ces_concepts:
-            st.error("Selecciona al menos un concepto para cesantías.")
+        if not prima_concepts or not ces_concepts:
+            st.error("La parametrización debe dejar al menos un concepto para prima y uno para cesantías.")
             st.stop()
 
         progress = st.progress(0)
         status = st.empty()
 
         status.write("Preparando población...")
-        population = build_population(md_std, accum_std, salary_std)
-        progress.progress(10)
+        population = build_population(accum_std, salary_std, md_std)
+        progress.progress(15)
 
-        prima_salary_concepts = sorted(set(prima_concepts) & set(salary_concepts))
-        prima_variable_concepts = sorted(set(prima_concepts) - set(salary_concepts))
-        ces_salary_concepts = sorted(set(ces_concepts) & set(salary_concepts))
-        ces_variable_concepts = sorted(set(ces_concepts) - set(salary_concepts))
-
-        status.write("Calculando salario histórico para prima...")
-        sal_prima, seg_prima = salary_average_for_period(population, salary_std, prima_start, prima_end, day_mode, "Prima")
-        progress.progress(25)
-
-        status.write("Calculando salario histórico para cesantías...")
-        sal_ces, seg_ces = salary_average_for_period(population, salary_std, ces_start, ces_end, day_mode, "Cesantias")
-        salary_segments = pd.concat([seg_prima, seg_ces], ignore_index=True)
+        status.write("Calculando prima con histórico salarial + acumulados...")
+        base_prima, sal_detail_prima, var_detail_prima = calc_base_for_label(
+            "Prima", population, salary_std, accum_std, prima_concepts, prima_start, prima_end, area_rules, concept_param
+        )
         progress.progress(40)
 
-        status.write("Calculando acumulados de prima...")
-        acc_prima_var = accum_base_for_period(population, accum_std, prima_variable_concepts, prima_start, prima_end, day_mode, "Prima", "variables acumuladas")
-        acc_prima_sal = accum_base_for_period(population, accum_std, prima_salary_concepts, prima_start, prima_end, day_mode, "Prima", "conceptos salariales acumulados")
-        acc_prima_total = accum_base_for_period(population, accum_std, prima_concepts, prima_start, prima_end, day_mode, "Prima", "total acumulados")
-        progress.progress(55)
+        status.write("Calculando cesantías con histórico salarial + acumulados...")
+        base_ces, sal_detail_ces, var_detail_ces = calc_base_for_label(
+            "Cesantias", population, salary_std, accum_std, ces_concepts, ces_start, ces_end, area_rules, concept_param
+        )
+        progress.progress(65)
 
-        status.write("Calculando acumulados de cesantías...")
-        acc_ces_var = accum_base_for_period(population, accum_std, ces_variable_concepts, ces_start, ces_end, day_mode, "Cesantias", "variables acumuladas")
-        acc_ces_sal = accum_base_for_period(population, accum_std, ces_salary_concepts, ces_start, ces_end, day_mode, "Cesantias", "conceptos salariales acumulados")
-        acc_ces_total = accum_base_for_period(population, accum_std, ces_concepts, ces_start, ces_end, day_mode, "Cesantias", "total acumulados")
-        progress.progress(70)
-
-        status.write("Armando bases finales...")
-        base_prima = compose_base_sheet(population, sal_prima, acc_prima_var, acc_prima_sal, acc_prima_total, prima_start, prima_end, "Prima", tolerance)
-        base_ces = compose_base_sheet(population, sal_ces, acc_ces_var, acc_ces_sal, acc_ces_total, ces_start, ces_end, "Cesantias", tolerance)
-
+        status.write("Armando salida...")
         llevar_modelo = base_prima[[
-            "SAP", "Cédula", "Nombre", "Área de nómina", "CECO", "Cargo", "Salario actual MD",
-            "Salario histórico promedio Prima", "Base promedio variables acumuladas Prima",
-            "Base final Prima histórico + acumulados", "Validación base acumulada SAP Prima",
-            "Diferencia final vs acumulado SAP Prima", "Estado Prima",
+            "SAP", "Cédula", "Nombre", "Área de nómina", "CECO", "Cargo",
+            "Salario histórico promedio Prima", "Promedio variable Prima", "Base calculada Prima",
+            "Base SAP acumulada estimada Prima", "Diferencia vs acumulados Prima", "Estado Prima",
         ]].merge(
             base_ces[[
-                "SAP", "Salario histórico promedio Cesantias", "Base promedio variables acumuladas Cesantias",
-                "Base final Cesantias histórico + acumulados", "Validación base acumulada SAP Cesantias",
-                "Diferencia final vs acumulado SAP Cesantias", "Estado Cesantias",
+                "SAP", "Salario histórico promedio Cesantias", "Promedio variable Cesantias", "Base calculada Cesantias",
+                "Base SAP acumulada estimada Cesantias", "Diferencia vs acumulados Cesantias", "Estado Cesantias",
             ]],
-            on="SAP",
-            how="outer",
+            on="SAP", how="outer",
         )
         llevar_modelo["Periodo prima usado"] = f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}"
         llevar_modelo["Periodo cesantías usado"] = f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}"
-        llevar_modelo["Método"] = "Base final = salario histórico promedio + acumulados variables promedio"
-        llevar_modelo["Observación"] = "Herramienta de validación de base prestacional; no usa proyección."
-        progress.progress(82)
+        llevar_modelo["Observación"] = "Validación con acumulados históricos e histórico de salarios; sin proyección."
 
-        status.write("Construyendo detalle, alertas y log...")
-        detail = build_detail_used(accum_std, prima_concepts, ces_concepts, salary_concepts, prima_start, prima_end, ces_start, ces_end)
-        concepts_table = build_concepts_table(accum_std, prima_concepts, ces_concepts, salary_concepts)
-        alerts = build_alerts(base_prima, base_ces, tolerance)
+        detail_accum = build_detail_accum(accum_std, concept_param, prima_concepts, ces_concepts, prima_start, prima_end, ces_start, ces_end)
+        sal_detail = pd.concat([sal_detail_prima, sal_detail_ces], ignore_index=True) if not sal_detail_prima.empty or not sal_detail_ces.empty else pd.DataFrame()
+        alerts = build_alerts(base_prima, base_ces)
+        progress.progress(80)
 
-        log_rows = read_log + [
-            {"Paso": "Periodo prima", "Resultado": f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}", "Detalle": f"Conceptos prima: {', '.join(prima_concepts)}"},
-            {"Paso": "Periodo cesantías", "Resultado": f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}", "Detalle": f"Conceptos cesantías: {', '.join(ces_concepts)}"},
-            {"Paso": "Conceptos salariales", "Resultado": ", ".join(salary_concepts), "Detalle": "Se validan con histórico de salarios y no se duplican como variable."},
-            {"Paso": "Días divisor", "Resultado": day_mode, "Detalle": "Se usa para salario histórico y acumulados."},
-            {"Paso": "Fórmula base", "Resultado": "Salario histórico promedio + variables acumuladas promedio", "Detalle": "Acumulados promedio = valor acumulado / días divisor * 30."},
-            {"Paso": "Tolerancia alertas", "Resultado": f"{tolerance:,.2f}", "Detalle": "Diferencias superiores generan alerta."},
-        ]
-        log_df = pd.DataFrame(log_rows)
-        progress.progress(92)
+        log_df = pd.DataFrame(read_log + [
+            {"Paso": "Periodo prima", "Resultado": f"{prima_start:%d/%m/%Y} - {prima_end:%d/%m/%Y}", "Detalle": "Últimos 6 meses si se dejó automático."},
+            {"Paso": "Periodo cesantías", "Resultado": f"{ces_start:%d/%m/%Y} - {ces_end:%d/%m/%Y}", "Detalle": "Últimos 3 meses si se dejó automático."},
+            {"Paso": "Reglas área", "Resultado": f"{len(area_rules):,} reglas", "Detalle": area_rules.to_dict(orient="records")},
+            {"Paso": "Conceptos salario fijo", "Resultado": ", ".join(sorted(FIXED_SALARY_CONCEPTS)), "Detalle": "Se calculan desde histórico salarial, no se duplican como variable."},
+            {"Paso": "Fórmula", "Resultado": "Base calculada = salario histórico promedio + promedio variable acumulado", "Detalle": "La base SAP acumulada estimada se deja como comparación."},
+        ])
 
-        status.write("Generando Excel...")
-        excel_bytes = make_excel_report(base_prima, base_ces, llevar_modelo, detail, salary_segments, concepts_table, alerts, log_df)
+        excel_bytes = make_excel_report(
+            llevar_modelo, base_prima, base_ces, detail_accum, sal_detail, concept_param, area_rules, alerts, log_df
+        )
         progress.progress(100)
-        status.success("Bases generadas correctamente.")
+        status.success("Validación generada correctamente.")
 
         st.subheader("✅ Resultado")
-        r1, r2, r3, r4 = st.columns(4)
+        r1, r2, r3 = st.columns(3)
         with r1:
-            st.metric("Empleados en salida", f"{len(llevar_modelo):,}")
+            st.metric("Empleados", f"{len(llevar_modelo):,}")
         with r2:
             st.metric("Alertas", f"{len(alerts):,}")
         with r3:
-            st.metric("Base prima total", f"{llevar_modelo['Base final Prima histórico + acumulados'].sum():,.0f}")
-        with r4:
-            st.metric("Base cesantías total", f"{llevar_modelo['Base final Cesantias histórico + acumulados'].sum():,.0f}")
+            st.metric("Tramos salariales calculados", f"{len(sal_detail):,}")
 
         st.dataframe(llevar_modelo.head(300), use_container_width=True)
-        if not alerts.empty:
-            with st.expander("⚠️ Alertas generadas", expanded=True):
-                st.dataframe(alerts, use_container_width=True)
-
-        file_name = f"bases_prima_cesantias_validacion_historico_salarios_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         st.download_button(
             "⬇️ Descargar Excel generado",
             data=excel_bytes,
-            file_name=file_name,
+            file_name=f"validacion_bases_prima_cesantias_{corte:%Y_%m_%d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
-
 else:
-    st.info("Carga como mínimo **Acumulados de nómina** e **Histórico de salarios** para continuar.")
+    st.info("Carga mínimo acumulados de nómina e histórico de salarios para continuar.")
 
 st.divider()
 st.caption("🦜 Creado por Andrés Huérfano Dávila - Nómina JMC")
