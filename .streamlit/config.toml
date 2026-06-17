@@ -1,0 +1,8 @@
+[server]
+# Tamaño máximo por archivo en MB para st.file_uploader.
+# El acumulado CONCEPENAY2026.txt pesa ~239 MB, por eso falla con el límite default de 200 MB.
+# Puedes subirlo a 1024 MB o 2048 MB si los archivos crecen más.
+maxUploadSize = 1024
+
+# Tamaño máximo de mensajes del servidor. Ayuda con archivos grandes y descargas pesadas.
+maxMessageSize = 1024
