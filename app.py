@@ -92,7 +92,7 @@ PERIOD_CANDIDATES = [
     "periodo pago", "período pago", "fecha contabilizacion", "fecha contabilización",
 ]
 
-MD_NAME_CANDIDATES = ["nombre", "nombres", "nombre completo", "empleado", "trabajador"]
+MD_NAME_CANDIDATES = ["nombre", "nombres", "nombre completo", "empleado", "trabajador", "número de personal", "numero de personal"]
 MD_DOC_CANDIDATES = ["cedula", "cédula", "numero id", "número id", "documento", "id", "identificacion", "identificación"]
 MD_AREA_CANDIDATES = ["area de nomina", "área de nómina", "area nomina", "área nómina", "area cálculo nómina", "area calculo nomina"]
 MD_CECO_CANDIDATES = ["ce.coste", "ce coste", "ceco", "centro de coste", "centro de costo"]
@@ -206,19 +206,117 @@ def detect_header_row(raw_preview: pd.DataFrame) -> int:
     return best_row if best_score > 0 else 0
 
 
+
+def read_sap_pipe_report(data: bytes) -> Optional[pd.DataFrame]:
+    """Lee reportes planos SAP con líneas de encabezado y separador |.
+
+    Ejemplo esperado:
+    |Nº pers.|Número de personal|Desde|Hasta|Importe|Mon.|CC-nómina|Área de nómina|
+    """
+    text = None
+    for enc in ["utf-8-sig", "latin1", "cp1252"]:
+        try:
+            text = data.decode(enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        return None
+
+    lines = text.splitlines()
+    header_idx = None
+    headers = []
+    for i, line in enumerate(lines):
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        norm_cells = [normalize_text(c) for c in cells]
+        joined = " ".join(norm_cells)
+        has_sap = any(c in {"nº pers.", "nº pers", "n pers", "numero de personal", "número de personal"} or "pers" in c for c in norm_cells)
+        has_dates = "desde" in joined and "hasta" in joined
+        has_amount = "importe" in joined or "valor" in joined or "salario" in joined
+        if len(cells) >= 5 and has_sap and has_dates and has_amount:
+            header_idx = i
+            headers = [c.strip() if c.strip() else f"Columna_{j+1}" for j, c in enumerate(cells)]
+            break
+
+    if header_idx is None:
+        return None
+
+    rows = []
+    width = len(headers)
+    for line in lines[header_idx + 1:]:
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        if not cells:
+            continue
+        # Saltar líneas separadoras o encabezados repetidos.
+        normalized_row = " ".join(normalize_text(c) for c in cells)
+        if set("".join(cells).replace(" ", "")) <= {"-"}:
+            continue
+        if "nº pers" in normalized_row or "numero de personal" in normalized_row or "número de personal" in normalized_row:
+            continue
+        if len(cells) < width:
+            cells = cells + [""] * (width - len(cells))
+        elif len(cells) > width:
+            # En caso de columnas adicionales, conservar lo que cabe y unir el exceso en la última columna.
+            cells = cells[: width - 1] + [" ".join(cells[width - 1:])]
+        # Debe parecer un registro de empleado o al menos tener fechas/importe.
+        first_digits = re.sub(r"\D", "", cells[0]) if cells else ""
+        if not first_digits and not any(re.search(r"\d{1,2}\.\d{1,2}\.\d{4}", c) for c in cells):
+            continue
+        rows.append(cells)
+
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=headers)
+    return clean_columns(df)
+
+
+def read_delimited_with_header_detection(data: bytes, sep: str, encoding: str) -> Optional[pd.DataFrame]:
+    """Lee CSV/TXT cuando el encabezado no está en la primera línea."""
+    try:
+        raw = pd.read_csv(io.BytesIO(data), sep=sep, encoding=encoding, dtype=str, engine="python", header=None, on_bad_lines="skip")
+    except Exception:
+        return None
+    if raw.empty or raw.shape[1] <= 1:
+        return None
+    header_row = detect_header_row(raw)
+    headers = raw.iloc[header_row].astype(str).str.strip().tolist()
+    if not any(normalize_text(h) for h in headers):
+        return None
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = [h if h and h.lower() != "nan" else f"Columna_{i+1}" for i, h in enumerate(headers)]
+    return clean_columns(df)
+
+
 def read_uploaded_table(uploaded_file, sheet_name: Optional[str] = None) -> pd.DataFrame:
     ext = get_extension(uploaded_file.name)
     data = uploaded_file.getvalue()
 
     if ext in CSV_EXTS:
-        best, best_cols = None, -1
+        # Primero intentar formato SAP plano con tuberías y encabezados de reporte.
+        sap_df = read_sap_pipe_report(data)
+        if sap_df is not None and not sap_df.empty:
+            return sap_df
+
+        best, best_score = None, -1
         for enc in ["utf-8-sig", "latin1", "cp1252"]:
             for sep in [";", ",", "\t", "|"]:
                 try:
-                    df = pd.read_csv(io.BytesIO(data), sep=sep, encoding=enc, dtype=str, engine="python")
+                    # Lectura normal.
+                    df = pd.read_csv(io.BytesIO(data), sep=sep, encoding=enc, dtype=str, engine="python", on_bad_lines="skip")
                     df = clean_columns(df)
-                    if len(df.columns) > best_cols:
-                        best, best_cols = df, len(df.columns)
+                    score = len(df.columns)
+                    # Lectura alternativa detectando encabezado dentro del archivo.
+                    detected = read_delimited_with_header_detection(data, sep, enc)
+                    if detected is not None:
+                        detected_score = len(detected.columns) + 3
+                        if detected_score > score:
+                            df, score = detected, detected_score
+                    if score > best_score:
+                        best, best_score = df, score
                 except Exception:
                     pass
         if best is None:
@@ -235,7 +333,6 @@ def read_uploaded_table(uploaded_file, sheet_name: Optional[str] = None) -> pd.D
 
     raise ValueError(f"Extensión no soportada: {ext}.")
 
-
 def normalize_sap(value) -> str:
     if value is None or pd.isna(value):
         return ""
@@ -247,19 +344,37 @@ def normalize_sap(value) -> str:
     return text.strip()
 
 
+
 def normalize_area(value) -> str:
     if value is None or pd.isna(value):
         return ""
-    text = str(value).upper().strip()
-    m = re.search(r"\b(ZM|ZL|ZH|ZP)\b", text)
+    raw = str(value).strip()
+    text = raw.upper()
+    text_no_acc = normalize_text(raw).upper()
+
+    m = re.search(r"\b(ZM|ZL|ZH|ZP)\b", text_no_acc)
     if m:
         return m.group(1)
-    # Si viene como texto largo, buscar la sigla pegada.
-    for area in ["ZM", "ZL", "ZH", "ZP"]:
-        if area in text:
-            return area
-    return text
 
+    # Mapeo de textos largos reales del histórico SAP / MD.
+    if "MENSUAL" in text_no_acc and ("365" in text_no_acc or "ADMON" in text_no_acc or "ADMIN" in text_no_acc):
+        return "ZL"
+    if "ADMINISTRATIVO" in text_no_acc or "ADMINISTRATIVOS" in text_no_acc:
+        return "ZM"
+    if "PART" in text_no_acc and ("HORA" in text_no_acc or "HORAS" in text_no_acc):
+        return "ZH"
+    if "PART" in text_no_acc and ("DIA" in text_no_acc or "DIAS" in text_no_acc):
+        return "ZP"
+    if ("TIEMPO PARCIAL" in text_no_acc or "PARCIAL" in text_no_acc) and "HORA" in text_no_acc:
+        return "ZH"
+    if ("TIEMPO PARCIAL" in text_no_acc or "PARCIAL" in text_no_acc) and "DIA" in text_no_acc:
+        return "ZP"
+
+    # Si viene como texto con la sigla pegada.
+    for area in ["ZM", "ZL", "ZH", "ZP"]:
+        if area in text_no_acc:
+            return area
+    return raw.strip()
 
 def extract_concept(value) -> str:
     if value is None or pd.isna(value):
@@ -512,50 +627,99 @@ def standardize_md(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     return out, detected
 
 
-def standardize_salary_history(df: pd.DataFrame, md_std: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, str]]:
+
+def parse_salary_until_date(value, validation_cutoff: date) -> pd.Timestamp:
+    """Parsea fecha Hasta del histórico salarial.
+
+    Regla clave: 31.12.9999 o cualquier fecha con año 9999 se reemplaza por la fecha de corte digitada por el usuario.
+    """
+    if value is None or pd.isna(value):
+        return pd.Timestamp(validation_cutoff)
+    s = str(value).strip()
+    if re.search(r"9999", s):
+        return pd.Timestamp(validation_cutoff)
+    parsed = parse_date_value(value)
+    if pd.isna(parsed):
+        return pd.Timestamp(validation_cutoff)
+    if parsed.year >= 9999:
+        return pd.Timestamp(validation_cutoff)
+    return parsed
+
+
+def standardize_salary_history(
+    df: pd.DataFrame,
+    md_std: Optional[pd.DataFrame] = None,
+    validation_cutoff: Optional[date] = None,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    if validation_cutoff is None:
+        validation_cutoff = date.today()
+
     sap_col = find_column(df, SAP_CANDIDATES)
     area_col = find_column(df, MD_AREA_CANDIDATES)
     sal_col = find_column(df, SAL_VALUE_CANDIDATES)
     from_col = find_column(df, SAL_FROM_CANDIDATES)
     to_col = find_column(df, SAL_TO_CANDIDATES)
+    concept_col = find_column(df, CONCEPT_CANDIDATES)
+    name_col = find_column(df, MD_NAME_CANDIDATES)
 
     missing = []
     if not sap_col:
         missing.append("SAP / Nº pers.")
     if not sal_col:
-        missing.append("Salario")
+        missing.append("Salario / Importe")
     if not from_col:
         missing.append("Fecha desde / inicio vigencia")
     if not to_col:
         missing.append("Fecha hasta / fin vigencia")
     if missing:
-        raise ValueError("No encontré estas columnas en histórico de salarios: " + ", ".join(missing))
+        raise ValueError(
+            "No encontré estas columnas en histórico de salarios: "
+            + ", ".join(missing)
+            + ". Para TXT SAP debe venir el encabezado con |Nº pers.|Desde|Hasta|Importe|CC-nómina|Área de nómina|."
+        )
 
     out = pd.DataFrame()
     out["SAP"] = df[sap_col].apply(normalize_sap)
+    out["Nombre histórico"] = df[name_col].astype(str).str.strip() if name_col else ""
     out["Área de nómina"] = df[area_col].apply(normalize_area) if area_col else ""
+    out["Concepto salario histórico"] = df[concept_col].astype(str).str.strip() if concept_col else ""
     out["Salario Vigencia"] = to_number_series(df[sal_col])
     out["Desde"] = parse_date_series(df[from_col])
-    out["Hasta"] = parse_date_series(df[to_col])
+    out["Hasta"] = df[to_col].apply(lambda x: parse_salary_until_date(x, validation_cutoff))
+
     out = out[(out["SAP"] != "") & (out["Salario Vigencia"] > 0)]
     out = out[pd.notna(out["Desde"])]
-    out.loc[pd.isna(out["Hasta"]), "Hasta"] = pd.Timestamp(9999, 12, 31)
 
+    # Completar área desde MD cuando el histórico no la traiga.
     if md_std is not None and not md_std.empty:
         area_map = md_std[["SAP", "Área de nómina"]].drop_duplicates("SAP")
         out = out.merge(area_map.rename(columns={"Área de nómina": "Área MD"}), on="SAP", how="left")
-        out["Área de nómina"] = out["Área de nómina"].where(out["Área de nómina"].astype(str).str.strip() != "", out["Área MD"].fillna(""))
+        out["Área de nómina"] = out["Área de nómina"].where(
+            out["Área de nómina"].astype(str).str.strip() != "",
+            out["Área MD"].fillna("")
+        )
         out = out.drop(columns=["Área MD"])
+
+    # Agrupar componentes exactamente iguales en vigencia para evitar filas duplicadas por el mismo tramo.
+    # Ojo: si sueldo básico y bono fijo tienen la misma vigencia, se suman como salario fijo histórico.
+    group_cols = ["SAP", "Nombre histórico", "Área de nómina", "Desde", "Hasta"]
+    out = out.groupby(group_cols, as_index=False, dropna=False).agg(
+        **{
+            "Salario Vigencia": ("Salario Vigencia", "sum"),
+            "Conceptos salario histórico": ("Concepto salario histórico", lambda x: " | ".join(sorted({str(v).strip() for v in x if str(v).strip()}))),
+        }
+    )
 
     detected = {
         "SAP": sap_col,
+        "Nombre": name_col or "No detectada",
         "Área de nómina": area_col or "No detectada; se completó con MD si existía",
-        "Salario": sal_col,
+        "Salario/Importe": sal_col,
         "Desde": from_col,
-        "Hasta": to_col,
+        "Hasta": f"{to_col} (31.12.9999 se reemplaza por {validation_cutoff:%d/%m/%Y})",
+        "Concepto salario histórico": concept_col or "No detectada",
     }
     return out, detected
-
 
 def standardize_concepts_param(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     concept_col = find_column(df, CONCEPT_CANDIDATES + ["codigo", "código"])
@@ -638,6 +802,7 @@ def build_population(accum: pd.DataFrame, salary_hist: pd.DataFrame, md_std: Opt
     return pop
 
 
+
 def calc_salary_average(
     salary_hist: pd.DataFrame,
     population: pd.DataFrame,
@@ -646,41 +811,101 @@ def calc_salary_average(
     period_end: date,
     label: str,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Calcula salario histórico promedio por vigencias.
+
+    Importante: cuando hay sueldo básico + bono fijo simultáneos, suma los componentes activos del tramo,
+    pero cuenta los días una sola vez. Esto evita duplicar el denominador.
+    """
     rows = []
-    for _, r in salary_hist.iterrows():
-        sap = r["SAP"]
-        area = normalize_area(r.get("Área de nómina", ""))
-        desde = r["Desde"]
-        hasta = r["Hasta"]
-        salario = float(r.get("Salario Vigencia", 0) or 0)
-        if pd.isna(desde) or salario <= 0:
+    if salary_hist is None or salary_hist.empty:
+        out = population[["SAP"]].copy()
+        out[f"Salario histórico promedio {label}"] = 0.0
+        out[f"Días salario histórico {label}"] = 0
+        out[f"Tramos salario {label}"] = 0
+        return out, pd.DataFrame()
+
+    pop_area = {}
+    if population is not None and not population.empty and "Área de nómina" in population.columns:
+        pop_area = population.set_index("SAP")["Área de nómina"].to_dict()
+
+    for sap, emp in salary_hist.groupby("SAP"):
+        emp = emp.copy()
+        emp = emp[(pd.notna(emp["Desde"])) & (pd.notna(emp["Hasta"])) & (emp["Salario Vigencia"] > 0)]
+        if emp.empty:
             continue
-        ini = max(period_start, desde.date())
-        fin_raw = hasta.date() if pd.notna(hasta) else date(9999, 12, 31)
-        fin = min(period_end, fin_raw)
-        if fin < ini:
+
+        # Recortar filas que sí cruzan el periodo evaluado.
+        clipped = []
+        for _, r in emp.iterrows():
+            desde = r["Desde"].date() if pd.notna(r["Desde"]) else None
+            hasta = r["Hasta"].date() if pd.notna(r["Hasta"]) else None
+            if desde is None or hasta is None:
+                continue
+            ini = max(period_start, desde)
+            fin = min(period_end, hasta)
+            if fin < ini:
+                continue
+            rr = r.to_dict()
+            rr["_ini"] = ini
+            rr["_fin"] = fin
+            clipped.append(rr)
+        if not clipped:
             continue
-        dias = area_days(ini, fin, area, area_rules)
-        if dias <= 0:
-            continue
-        rows.append(
-            {
-                "SAP": sap,
-                "Etiqueta": label,
-                "Área de nómina salario": area,
-                "Desde tramo": ini,
-                "Hasta tramo": fin,
-                "Salario Vigencia": salario,
-                "Días salario": dias,
-                "Salario x días": salario * dias,
-            }
-        )
+
+        # Puntos de cambio para crear tramos sin solapamientos.
+        boundaries = set()
+        for r in clipped:
+            boundaries.add(r["_ini"])
+            boundaries.add(r["_fin"] + timedelta(days=1))
+        ordered = sorted(boundaries)
+        for i in range(len(ordered) - 1):
+            ini = ordered[i]
+            fin = ordered[i + 1] - timedelta(days=1)
+            if fin < ini:
+                continue
+            active = [r for r in clipped if r["_ini"] <= ini and r["_fin"] >= fin]
+            if not active:
+                continue
+            salario_total = sum(float(r.get("Salario Vigencia", 0) or 0) for r in active)
+            if salario_total <= 0:
+                continue
+            area = ""
+            for r in active:
+                area_candidate = normalize_area(r.get("Área de nómina", ""))
+                if area_candidate:
+                    area = area_candidate
+                    break
+            if not area:
+                area = normalize_area(pop_area.get(sap, ""))
+            dias = area_days(ini, fin, area, area_rules)
+            if dias <= 0:
+                continue
+            concepts = []
+            for r in active:
+                c = str(r.get("Conceptos salario histórico", "") or "").strip()
+                if c:
+                    concepts.extend([x.strip() for x in c.split("|") if x.strip()])
+            rows.append(
+                {
+                    "SAP": sap,
+                    "Etiqueta": label,
+                    "Área de nómina salario": area,
+                    "Desde tramo": ini,
+                    "Hasta tramo": fin,
+                    "Salario Vigencia": salario_total,
+                    "Días salario": dias,
+                    "Salario x días": salario_total * dias,
+                    "Componentes activos": len(active),
+                    "Conceptos salario histórico": " | ".join(sorted(set(concepts))),
+                }
+            )
 
     detail = pd.DataFrame(rows)
     if detail.empty:
         out = population[["SAP"]].copy()
         out[f"Salario histórico promedio {label}"] = 0.0
         out[f"Días salario histórico {label}"] = 0
+        out[f"Tramos salario {label}"] = 0
         return out, detail
 
     grouped = detail.groupby("SAP", as_index=False).agg(
@@ -694,7 +919,6 @@ def calc_salary_average(
         grouped[f"Salario x días {label}"] / grouped[f"Días salario histórico {label}"].replace(0, pd.NA)
     ).fillna(0.0)
     return grouped, detail
-
 
 def calc_accum_average(
     accum: pd.DataFrame,
@@ -1058,7 +1282,7 @@ if accum_file and accum_sheet:
 if salary_file and salary_sheet:
     try:
         salary_raw = read_uploaded_table(salary_file, salary_sheet)
-        salary_std, salary_detected = standardize_salary_history(salary_raw, md_std)
+        salary_std, salary_detected = standardize_salary_history(salary_raw, md_std, corte)
         read_log.append({"Paso": "Histórico salarios", "Resultado": f"OK - {len(salary_std):,} vigencias", "Detalle": str(salary_detected)})
         st.success(f"Histórico de salarios leído: {len(salary_std):,} vigencias")
         with st.expander("Columnas detectadas en histórico de salarios"):

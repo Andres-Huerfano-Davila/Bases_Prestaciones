@@ -1,37 +1,37 @@
-# Validador bases de prima y cesantías - Nómina JMC
+# Validador de bases de prima y cesantías - Nómina JMC
 
-Esta app de Streamlit valida las bases de prima y cesantías usando:
+Herramienta Streamlit para validar bases de prima y cesantías usando:
 
 - Acumulados históricos de nómina.
-- Histórico de salarios por vigencias.
-- Master Data / empleados opcional.
-- Parametrización opcional de conceptos y áreas de nómina.
+- Histórico de salarios SAP.
+- Master Data opcional.
+- Parametrización opcional de conceptos y reglas por área de nómina.
 
-No es una herramienta de proyección. No toma un mes proyectado ni suma pagos proyectados.
+## Corrección clave de esta versión
+
+El histórico de salarios puede venir como reporte SAP TXT con tuberías, por ejemplo:
+
+`|Nº pers.|Número de personal|Desde|Hasta|Importe|Mon.|CC-nómina|Área de nómina|`
+
+La app detecta ese encabezado aunque no esté en la primera fila del archivo.
+
+También aplica esta regla:
+
+`Hasta = 31.12.9999` se reemplaza por la **fecha de corte de validación** digitada por el usuario.
 
 ## Lógica principal
 
-Base calculada = salario histórico promedio por vigencias + promedio variable de acumulados.
+Base calculada = salario histórico promedio por vigencias + variables promedio desde acumulados.
 
-Los conceptos de salario fijo `Y010`, `Y011`, `Y020`, `Y050`, `Y051`, `Y090` se calculan desde el histórico salarial para no duplicarlos como variables acumuladas.
+Cuando existen varios componentes fijos simultáneos en el histórico salarial, por ejemplo Sueldo Básico + Bono Antigüedad Operación, la app suma los valores activos del tramo, pero cuenta los días una sola vez.
 
-## Reglas default por área de nómina
+## Reglas por área
 
-- ZM: días 360.
-- ZL: días calendario.
-- ZH: días calendario / base 365 para promedio.
-- ZP: días calendario / base 365 para promedio.
+- ZM / ADMINISTRATIVOS: días 360.
+- ZL / MENSUAL ADMON 365: días calendario.
+- ZH / tiempo parcial horas: días calendario/base 365.
+- ZP / tiempo parcial días: días calendario/base 365.
 
-La app permite editar o cargar esta parametrización.
+## Streamlit Cloud
 
-## Despliegue en Streamlit Cloud
-
-Sube al repositorio:
-
-```text
-app.py
-requirements.txt
-.streamlit/config.toml
-```
-
-El archivo `.streamlit/config.toml` sube el límite de carga a 1 GB.
+Incluye `.streamlit/config.toml` para permitir cargas de hasta 1 GB por archivo.
