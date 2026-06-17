@@ -184,6 +184,71 @@ def get_sheet_names(uploaded_file) -> List[str]:
     return xls.sheet_names
 
 
+def decode_text_bytes(data: bytes) -> str:
+    for enc in ["utf-8-sig", "latin1", "cp1252"]:
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("latin1", errors="ignore")
+
+
+def parse_sap_pipe_report(data: bytes) -> Optional[pd.DataFrame]:
+    """Lee reportes planos SAP tipo ALV exportados con tuberías.
+
+    Ejemplo esperado:
+    |Nº pers.|Número de personal|Desde|Hasta|Importe|Mon.|CC-nómina|Área de nómina|
+    |60000001|Nombre empleado|01.01.2026|31.12.9999| 1.750.905 |COP|Sueldo Básico|MENSUAL ADMON 365|
+    """
+    text = decode_text_bytes(data)
+    lines = text.splitlines()
+    header_idx = None
+    header = None
+    markers = ["nº pers", "n° pers", "no pers", "desde", "hasta", "importe", "cc-nomina", "cc-nómina", "area de nomina", "área de nómina"]
+
+    for i, line in enumerate(lines[:200]):
+        if "|" not in line:
+            continue
+        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+        norm_line = normalize_text(" ".join(parts))
+        score = sum(1 for m in markers if normalize_text(m) in norm_line)
+        if len(parts) >= 4 and score >= 3:
+            header_idx = i
+            header = parts
+            break
+
+    if header_idx is None or not header:
+        return None
+
+    rows = []
+    expected = len(header)
+    for line in lines[header_idx + 1:]:
+        raw = line.strip()
+        if not raw or "|" not in raw:
+            continue
+        if set(raw.replace("|", "").strip()) <= {"-"}:
+            continue
+        parts = [p.strip() for p in raw.strip("|").split("|")]
+        if len(parts) != expected:
+            continue
+        norm_first = normalize_text(parts[0])
+        norm_join = normalize_text(" ".join(parts))
+        if not parts[0] or norm_first in {"nº pers", "n° pers", "no pers", "n pers"}:
+            continue
+        if "historico de salarios" == norm_join:
+            continue
+        # Evita líneas de cierre o subtítulos.
+        if not re.search(r"\d", parts[0]):
+            continue
+        rows.append(parts)
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=header)
+    return clean_columns(df)
+
+
 def detect_header_row(raw_preview: pd.DataFrame) -> int:
     keywords = (
         SAP_CANDIDATES + CONCEPT_CANDIDATES + VALUE_CANDIDATES + PERIOD_CANDIDATES
@@ -211,6 +276,10 @@ def read_uploaded_table(uploaded_file, sheet_name: Optional[str] = None) -> pd.D
     data = uploaded_file.getvalue()
 
     if ext in CSV_EXTS:
+        sap_pipe = parse_sap_pipe_report(data)
+        if sap_pipe is not None and not sap_pipe.empty:
+            return sap_pipe
+
         best, best_cols = None, -1
         for enc in ["utf-8-sig", "latin1", "cp1252"]:
             for sep in [";", ",", "\t", "|"]:
@@ -251,14 +320,28 @@ def normalize_area(value) -> str:
     if value is None or pd.isna(value):
         return ""
     text = str(value).upper().strip()
+    text_norm = normalize_text(text).upper()
+
+    # Códigos directos SAP/nomina.
     m = re.search(r"\b(ZM|ZL|ZH|ZP)\b", text)
     if m:
         return m.group(1)
-    # Si viene como texto largo, buscar la sigla pegada.
+
+    # Descripciones largas que vienen en reportes SAP.
+    if "MENSUAL" in text_norm and ("365" in text_norm or "ADMON" in text_norm):
+        return "ZL"
+    if "ADMINISTRATIVO" in text_norm or "ADMINISTRATIVOS" in text_norm:
+        return "ZM"
+    if (("PART" in text_norm and "TIME" in text_norm) or "PARCIAL" in text_norm) and ("HORA" in text_norm or "HORAS" in text_norm):
+        return "ZH"
+    if (("PART" in text_norm and "TIME" in text_norm) or "PARCIAL" in text_norm) and ("DIA" in text_norm or "DIAS" in text_norm):
+        return "ZP"
+
+    # Si viene la sigla pegada en algún texto.
     for area in ["ZM", "ZL", "ZH", "ZP"]:
         if area in text:
             return area
-    return text
+    return text.strip()
 
 
 def extract_concept(value) -> str:
@@ -331,6 +414,10 @@ def parse_date_value(value) -> pd.Timestamp:
     if not s:
         return pd.NaT
     s = re.sub(r"\s+00:00:00$", "", s)
+    # Pandas no soporta 31.12.9999; para efectos de vigencia abierta
+    # usamos una fecha máxima segura.
+    if re.search(r"9999", s):
+        return pd.Timestamp("2262-04-11")
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 
@@ -518,6 +605,7 @@ def standardize_salary_history(df: pd.DataFrame, md_std: Optional[pd.DataFrame] 
     sal_col = find_column(df, SAL_VALUE_CANDIDATES)
     from_col = find_column(df, SAL_FROM_CANDIDATES)
     to_col = find_column(df, SAL_TO_CANDIDATES)
+    salary_concept_col = find_column(df, CONCEPT_CANDIDATES + CONCEPT_TEXT_CANDIDATES + ["concepto salario", "clase salario"])
 
     missing = []
     if not sap_col:
@@ -534,12 +622,13 @@ def standardize_salary_history(df: pd.DataFrame, md_std: Optional[pd.DataFrame] 
     out = pd.DataFrame()
     out["SAP"] = df[sap_col].apply(normalize_sap)
     out["Área de nómina"] = df[area_col].apply(normalize_area) if area_col else ""
+    out["Concepto salario histórico"] = df[salary_concept_col].astype(str).str.strip() if salary_concept_col else ""
     out["Salario Vigencia"] = to_number_series(df[sal_col])
     out["Desde"] = parse_date_series(df[from_col])
     out["Hasta"] = parse_date_series(df[to_col])
     out = out[(out["SAP"] != "") & (out["Salario Vigencia"] > 0)]
     out = out[pd.notna(out["Desde"])]
-    out.loc[pd.isna(out["Hasta"]), "Hasta"] = pd.Timestamp(9999, 12, 31)
+    out.loc[pd.isna(out["Hasta"]), "Hasta"] = pd.Timestamp("2262-04-11")
 
     if md_std is not None and not md_std.empty:
         area_map = md_std[["SAP", "Área de nómina"]].drop_duplicates("SAP")
@@ -553,6 +642,7 @@ def standardize_salary_history(df: pd.DataFrame, md_std: Optional[pd.DataFrame] 
         "Salario": sal_col,
         "Desde": from_col,
         "Hasta": to_col,
+        "Concepto salario histórico": salary_concept_col or "No detectada",
     }
     return out, detected
 
@@ -656,7 +746,7 @@ def calc_salary_average(
         if pd.isna(desde) or salario <= 0:
             continue
         ini = max(period_start, desde.date())
-        fin_raw = hasta.date() if pd.notna(hasta) else date(9999, 12, 31)
+        fin_raw = hasta.date() if pd.notna(hasta) else date(2262, 4, 11)
         fin = min(period_end, fin_raw)
         if fin < ini:
             continue
@@ -670,6 +760,7 @@ def calc_salary_average(
                 "Área de nómina salario": area,
                 "Desde tramo": ini,
                 "Hasta tramo": fin,
+                "Concepto salario histórico": r.get("Concepto salario histórico", ""),
                 "Salario Vigencia": salario,
                 "Días salario": dias,
                 "Salario x días": salario * dias,
@@ -683,13 +774,39 @@ def calc_salary_average(
         out[f"Días salario histórico {label}"] = 0
         return out, detail
 
-    grouped = detail.groupby("SAP", as_index=False).agg(
+    # Numerador: suma de todos los componentes fijos vigentes
+    # (sueldo básico + bonos fijos del histórico, si vienen en el reporte).
+    numerator = detail.groupby("SAP", as_index=False).agg(
         **{
             f"Salario x días {label}": ("Salario x días", "sum"),
-            f"Días salario histórico {label}": ("Días salario", "sum"),
             f"Tramos salario {label}": ("Salario Vigencia", "size"),
         }
     )
+
+    # Denominador: días únicos cubiertos por vigencias salariales.
+    # No se deben duplicar cuando el empleado tiene sueldo + bono fijo en las mismas fechas.
+    coverage = detail[["SAP", "Área de nómina salario", "Desde tramo", "Hasta tramo"]].drop_duplicates()
+    denom_rows = []
+    for sap, g in coverage.groupby("SAP"):
+        intervals = []
+        for _, rr in g.sort_values(["Desde tramo", "Hasta tramo"]).iterrows():
+            intervals.append((rr["Desde tramo"], rr["Hasta tramo"], rr["Área de nómina salario"]))
+        merged = []
+        for ini, fin, area in intervals:
+            if not merged:
+                merged.append([ini, fin, area])
+                continue
+            last = merged[-1]
+            if area == last[2] and ini <= last[1] + timedelta(days=1):
+                if fin > last[1]:
+                    last[1] = fin
+            else:
+                merged.append([ini, fin, area])
+        dias_unicos = sum(area_days(ini, fin, area, area_rules) for ini, fin, area in merged)
+        denom_rows.append({"SAP": sap, f"Días salario histórico {label}": dias_unicos})
+
+    denominator = pd.DataFrame(denom_rows)
+    grouped = numerator.merge(denominator, on="SAP", how="left")
     grouped[f"Salario histórico promedio {label}"] = (
         grouped[f"Salario x días {label}"] / grouped[f"Días salario histórico {label}"].replace(0, pd.NA)
     ).fillna(0.0)
@@ -942,7 +1059,7 @@ def make_excel_report(
 # -----------------------------
 
 st.title("🦜 Validador de bases de prima y cesantías")
-st.caption("Modelo financiero nómina · Acumulados históricos + histórico de salarios · Sin proyección")
+st.caption("Modelo financiero nómina · Acumulados históricos + histórico de salarios · Sin proyección · Parser SAP TXT corregido")
 
 with st.expander("📌 Qué hace esta versión", expanded=True):
     st.markdown(
